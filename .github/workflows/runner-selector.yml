@@ -1,0 +1,46 @@
+name: Runner Selector
+
+on:
+  workflow_call:
+    outputs:
+      runner-label:
+        description: "Runner label for this repository"
+        value: ${{ jobs.select-runner.outputs.runner-label }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  select-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      runner-label: ${{ steps.set-runner.outputs.runner-label }}
+    steps:
+      - id: set-runner
+        shell: bash
+        env:
+          USE_SELF_HOSTED: ${{ vars.USE_SELF_HOSTED }}
+          SELF_HOSTED_RUNNER_LABEL: ${{ vars.SELF_HOSTED_RUNNER_LABEL }}
+          TRUSTED_RUNNER_LABEL: ${{ vars.TRUSTED_RUNNER_LABEL }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          set -euo pipefail
+
+          # Never run untrusted public forks on internal cluster runners
+          if [ "${IS_FORK:-false}" = "true" ]; then
+            echo "Untrusted fork detected, using GitHub-hosted runner."
+            echo "runner-label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          elif [ "${USE_SELF_HOSTED:-true}" = "true" ] && [ -n "${SELF_HOSTED_RUNNER_LABEL:-}" ]; then
+            echo "Using configured cluster runner: ${SELF_HOSTED_RUNNER_LABEL}"
+            echo "runner-label=${SELF_HOSTED_RUNNER_LABEL}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${TRUSTED_RUNNER_LABEL:-}" ]; then
+            echo "Using trusted runner: ${TRUSTED_RUNNER_LABEL}"
+            echo "runner-label=${TRUSTED_RUNNER_LABEL}" >> "$GITHUB_OUTPUT"
+          elif [ "${USE_SELF_HOSTED:-true}" = "true" ]; then
+            echo "Defaulting to in-cluster runner: home-gh-runner-linux-quest"
+            echo "runner-label=home-gh-runner-linux-quest" >> "$GITHUB_OUTPUT"
+          else
+            echo "Using standard GitHub-hosted runner."
+            echo "runner-label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          fi

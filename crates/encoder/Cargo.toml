@@ -1,0 +1,18 @@
+[package]
+name = "linux-quest-encoder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+linux-quest-protocol = { path = "../protocol" }
+linux-quest-capture = { path = "../capture" }
+bytes.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

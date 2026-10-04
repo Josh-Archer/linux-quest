@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "ROADMAP.md"
+      - "ARCHITECTURE.md"
+      - "docs/**"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "README.md"
+      - "ROADMAP.md"
+      - "ARCHITECTURE.md"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  runner:
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/runner-selector.yml
+
+  test:
+    name: Build, Lint & Test
+    needs: runner
+    runs-on: ${{ needs.runner.outputs.runner-label }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "linux-quest-ci"
+
+      - name: Verify code formatting
+        run: cargo fmt --check
+
+      - name: Run clippy linter
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      - name: Run workspace unit and integration tests
+        run: cargo test --workspace --verbose
+
+      - name: Verify workspace documentation builds cleanly
+        run: cargo doc --workspace --no-deps

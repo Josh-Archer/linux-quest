@@ -1,0 +1,22 @@
+[package]
+name = "linux-quest-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+linux-quest-protocol = { path = "../protocol" }
+linux-quest-capture = { path = "../capture" }
+linux-quest-encoder = { path = "../encoder" }
+linux-quest-transport = { path = "../transport" }
+linux-quest-input = { path = "../input" }
+tokio.workspace = true
+bytes.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]

@@ -1,0 +1,31 @@
+use crate::video::VideoCodec;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    pub display_id: u16,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_rate: u32,
+    pub dpi: u32,
+    pub is_virtual: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHandshake {
+    pub client_version: u32,
+    pub device_model: String,
+    pub supported_codecs: Vec<VideoCodec>,
+    pub requested_displays: u16,
+    pub max_bandwidth_mbps: u32,
+    pub preferred_refresh_rate: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerHandshake {
+    pub server_version: u32,
+    pub selected_codec: VideoCodec,
+    pub negotiated_bitrate_mbps: u32,
+    pub displays: Vec<DisplayInfo>,
+}
