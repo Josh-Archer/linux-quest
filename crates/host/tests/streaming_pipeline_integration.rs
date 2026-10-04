@@ -132,3 +132,35 @@ async fn test_bidirectional_control_and_input_flow() {
         .await
         .expect("Handle RPI failed");
 }
+
+#[tokio::test]
+async fn test_auto_hardware_pipeline_stream() {
+    let capture = linux_quest_capture::AutoCapture::new(0, 1920, 1080, 90);
+    let encoder_config = linux_quest_encoder::EncoderConfig {
+        codec: VideoCodec::Av1,
+        width: 1920,
+        height: 1080,
+        fps: 90,
+        bitrate_kbps: 100_000,
+        intra_refresh_period: 30,
+        max_chunk_size: 1400,
+    };
+    let encoder = linux_quest_encoder::AutoVideoEncoder::new(encoder_config.clone());
+    let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+    let input = MockInputInjector::new();
+
+    let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+    session
+        .init(encoder_config)
+        .await
+        .expect("Session init failed");
+
+    let frame_id = session
+        .step_stream_frame()
+        .await
+        .expect("Hardware stream frame failed");
+    assert_eq!(frame_id, 1);
+
+    let packet = ep_client.recv_packet().await.expect("Client recv failed");
+    assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
+}

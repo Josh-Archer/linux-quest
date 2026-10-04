@@ -68,6 +68,17 @@ where
         self.running.clone()
     }
 
+    /// Initialize capture and encoder backends.
+    pub async fn init(
+        &mut self,
+        config: linux_quest_encoder::EncoderConfig,
+    ) -> Result<(), HostError> {
+        self.capture.init().await?;
+        self.encoder.init(config).await?;
+        self.running.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Process one frame: Capture -> Hardware Encode -> Packetize -> Transport Send.
     pub async fn step_stream_frame(&mut self) -> Result<u64, HostError> {
         let raw_frame = self.capture.capture_frame().await?;
