@@ -731,6 +731,15 @@ impl VideoEncoder for NvencEncoder {
             }
         }
 
+        match frame.format {
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 => {}
+            unsupported => {
+                return Err(EncoderError::EncodeFailed(format!(
+                    "Unsupported input pixel format {unsupported:?} for ARGB NVENC encoder"
+                )));
+            }
+        }
+
         let encode_start = Instant::now();
         self.frame_counter += 1;
 
@@ -768,7 +777,7 @@ impl VideoEncoder for NvencEncoder {
                 let row_bytes = (width * 4).min(src_stride);
 
                 if frame.format == PixelFormat::Rgba8 {
-                    // Convert RGBA -> BGRA (swap R and B channels into ARGB input buffer)
+                    // Swap byte 0 (R) and byte 2 (B) for NV_ENC_BUFFER_FORMAT_ARGB (little-endian B,G,R,A)
                     for y in 0..height {
                         let src_start = y * src_stride;
                         let dst_start = y * pitch;
@@ -778,10 +787,10 @@ impl VideoEncoder for NvencEncoder {
                             let dst_row = &mut dst[dst_start..dst_start + row_bytes];
                             for x in (0..row_bytes).step_by(4) {
                                 if x + 3 < row_bytes {
-                                    dst_row[x] = src_row[x + 2]; // B <- R
-                                    dst_row[x + 1] = src_row[x + 1]; // G <- G
-                                    dst_row[x + 2] = src_row[x]; // R <- B
-                                    dst_row[x + 3] = src_row[x + 3]; // A <- A
+                                    dst_row[x] = src_row[x + 2]; // dst B (byte 0) <- src B (byte 2)
+                                    dst_row[x + 1] = src_row[x + 1]; // dst G (byte 1) <- src G (byte 1)
+                                    dst_row[x + 2] = src_row[x]; // dst R (byte 2) <- src R (byte 0)
+                                    dst_row[x + 3] = src_row[x + 3]; // dst A (byte 3) <- src A (byte 3)
                                 }
                             }
                         }
@@ -1067,7 +1076,14 @@ mod tests {
         encoder.invalidate_reference_picture(3000);
         assert_eq!(encoder.last_rpi_frame, Some(3000));
 
-        // Frame 4: RGBA8 format frame testing channel conversion to ARGB buffer
+        // Frame 4: RGBA8 format frame testing channel conversion to ARGB buffer with distinct channels
+        let mut rgba_buf = vec![0u8; 1280 * 720 * 4];
+        for i in (0..rgba_buf.len()).step_by(4) {
+            rgba_buf[i] = 10; // R
+            rgba_buf[i + 1] = 20; // G
+            rgba_buf[i + 2] = 30; // B
+            rgba_buf[i + 3] = 255; // A
+        }
         let frame4 = RawFrame {
             display_id: 0,
             width: 1280,
@@ -1076,13 +1092,27 @@ mod tests {
             format: PixelFormat::Rgba8,
             pts_us: 4000,
             dma_buf: None,
-            data: Bytes::from(vec![200u8; 1280 * 720 * 4]),
+            data: Bytes::from(rgba_buf),
         };
         let encoded4 = encoder
             .encode(&frame4)
             .await
             .expect("Encode frame 4 (Rgba8) failed");
         assert_eq!(encoded4.frame_id, 4);
+
+        // Verify unsupported format (Nv12) is rejected cleanly
+        let frame_unsupported = RawFrame {
+            display_id: 0,
+            width: 1280,
+            height: 720,
+            stride: 1280,
+            format: PixelFormat::Nv12,
+            pts_us: 5000,
+            dma_buf: None,
+            data: Bytes::from(vec![0u8; 1280 * 720 * 3 / 2]),
+        };
+        let res = encoder.encode(&frame_unsupported).await;
+        assert!(matches!(res, Err(EncoderError::EncodeFailed(_))));
 
         // Test HEVC hardware session initialization and encode
         let mut hevc_encoder = NvencEncoder::new(EncoderConfig {

@@ -19,6 +19,7 @@ type PwMainLoopDestroyFn = unsafe extern "C" fn(*mut c_void);
 type PwContextNewFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
 type PwContextConnectFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
 type PwContextDestroyFn = unsafe extern "C" fn(*mut c_void);
+type PwCoreDisconnectFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 /// Zero-copy screen capture engine powered by PipeWire and DMA-BUF.
 pub struct PipeWireCapture {
@@ -87,11 +88,44 @@ impl PipeWireCapture {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
+
+    pub fn cleanup(&mut self) {
+        if let Some(lib) = &self._lib {
+            unsafe {
+                if !self.core_ptr.is_null() {
+                    if let Ok(pw_core_disconnect) =
+                        lib.get::<PwCoreDisconnectFn>(b"pw_core_disconnect\0")
+                    {
+                        let _ = pw_core_disconnect(self.core_ptr);
+                    }
+                    self.core_ptr = std::ptr::null_mut();
+                }
+                if !self.ctx_ptr.is_null() {
+                    if let Ok(pw_context_destroy) =
+                        lib.get::<PwContextDestroyFn>(b"pw_context_destroy\0")
+                    {
+                        pw_context_destroy(self.ctx_ptr);
+                    }
+                    self.ctx_ptr = std::ptr::null_mut();
+                }
+                if !self.loop_ptr.is_null() {
+                    if let Ok(pw_main_loop_destroy) =
+                        lib.get::<PwMainLoopDestroyFn>(b"pw_main_loop_destroy\0")
+                    {
+                        pw_main_loop_destroy(self.loop_ptr);
+                    }
+                    self.loop_ptr = std::ptr::null_mut();
+                }
+            }
+        }
+        self.initialized = false;
+    }
 }
 
 #[async_trait]
 impl DisplayCapture for PipeWireCapture {
     async fn init(&mut self) -> Result<(), CaptureError> {
+        self.cleanup();
         let lib = unsafe {
             Library::new("libpipewire-0.3.so.0")
                 .or_else(|_| Library::new("libpipewire-0.3.so"))
@@ -186,26 +220,7 @@ impl DisplayCapture for PipeWireCapture {
 
 impl Drop for PipeWireCapture {
     fn drop(&mut self) {
-        if let Some(lib) = &self._lib {
-            unsafe {
-                if !self.ctx_ptr.is_null() {
-                    if let Ok(pw_context_destroy) =
-                        lib.get::<PwContextDestroyFn>(b"pw_context_destroy\0")
-                    {
-                        pw_context_destroy(self.ctx_ptr);
-                    }
-                    self.ctx_ptr = std::ptr::null_mut();
-                }
-                if !self.loop_ptr.is_null() {
-                    if let Ok(pw_main_loop_destroy) =
-                        lib.get::<PwMainLoopDestroyFn>(b"pw_main_loop_destroy\0")
-                    {
-                        pw_main_loop_destroy(self.loop_ptr);
-                    }
-                    self.loop_ptr = std::ptr::null_mut();
-                }
-            }
-        }
+        self.cleanup();
     }
 }
 
