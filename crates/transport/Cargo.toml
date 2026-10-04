@@ -1,0 +1,17 @@
+[package]
+name = "linux-quest-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+linux-quest-protocol = { path = "../protocol" }
+bytes.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

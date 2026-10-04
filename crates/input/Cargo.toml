@@ -1,0 +1,16 @@
+[package]
+name = "linux-quest-input"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+linux-quest-protocol = { path = "../protocol" }
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
