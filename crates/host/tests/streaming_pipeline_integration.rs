@@ -26,6 +26,19 @@ async fn test_full_pipeline_multi_frame_streaming_and_reassembly() {
     let input = MockInputInjector::new();
 
     let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+    session
+        .init(EncoderConfig {
+            codec: VideoCodec::Av1,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 50_000,
+            intra_refresh_period: 5,
+            max_chunk_size: 1024,
+        })
+        .await
+        .expect("Session init failed");
+
     let mut reassembler = FrameReassembler::new(8);
 
     // Stream 10 consecutive frames
@@ -68,6 +81,10 @@ async fn test_bidirectional_control_and_input_flow() {
     let input = MockInputInjector::new();
 
     let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+    session
+        .init(EncoderConfig::default())
+        .await
+        .expect("Session init failed");
 
     // 1. Client sends Ping, Host responds with Pong
     let ping_payload = Bytes::from_static(b"latency-probe-timestamp");
@@ -113,9 +130,9 @@ async fn test_bidirectional_control_and_input_flow() {
         .await
         .expect("Handle mouse event failed");
 
-    // 3. Client sends Reference Picture Invalidation (RPI) feedback
-    let rpi_frame_id = 7u64;
-    let rpi_payload = Bytes::copy_from_slice(&rpi_frame_id.to_be_bytes());
+    // 3. Client sends Reference Picture Invalidation (RPI) feedback carrying frame pts_us
+    let rpi_pts_us = 602_000u64;
+    let rpi_payload = Bytes::copy_from_slice(&rpi_pts_us.to_be_bytes());
     let rpi_packet = Packet::new(
         PacketHeader::new(
             PacketType::ReferencePictureInvalidation,
@@ -131,4 +148,53 @@ async fn test_bidirectional_control_and_input_flow() {
         .handle_incoming_packet(rpi_packet)
         .await
         .expect("Handle RPI failed");
+
+    assert_eq!(session.encoder().last_rpi_pts(), Some(602_000));
+}
+
+#[tokio::test]
+async fn test_auto_hardware_pipeline_stream() {
+    let capture = linux_quest_capture::AutoCapture::new(0, 1920, 1080, 90);
+    let encoder_config = linux_quest_encoder::EncoderConfig {
+        codec: VideoCodec::Av1,
+        width: 1920,
+        height: 1080,
+        fps: 90,
+        bitrate_kbps: 100_000,
+        intra_refresh_period: 30,
+        max_chunk_size: 1400,
+    };
+    let encoder = linux_quest_encoder::AutoVideoEncoder::new(encoder_config.clone());
+    let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+    let input = MockInputInjector::new();
+
+    let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+    session
+        .init(encoder_config)
+        .await
+        .expect("Session init failed");
+
+    let frame_id = session
+        .step_stream_frame()
+        .await
+        .expect("Hardware stream frame failed");
+    assert_eq!(frame_id, 1);
+
+    let packet = ep_client.recv_packet().await.expect("Client recv failed");
+    assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
+    assert_ne!(packet.header.flags & linux_quest_protocol::FLAG_KEYFRAME, 0);
+
+    let chunk = VideoChunk::deserialize(&packet.payload).expect("Chunk deserialization failed");
+    assert_eq!(chunk.meta.frame_id, 1);
+    assert!(chunk.meta.is_keyframe);
+    assert_eq!(chunk.meta.codec, VideoCodec::Av1);
+    assert!(!chunk.payload.is_empty());
+
+    if linux_quest_encoder::NvencEncoder::is_available() {
+        let obu_type = (chunk.payload[0] >> 3) & 0x0f;
+        assert!(
+            obu_type == 1 || obu_type == 2,
+            "Hardware AV1 stream must start with Sequence Header or Temporal Delimiter OBU, got {obu_type}"
+        );
+    }
 }
