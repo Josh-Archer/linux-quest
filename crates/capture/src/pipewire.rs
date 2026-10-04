@@ -1,17 +1,11 @@
 use async_trait::async_trait;
-use bytes::Bytes;
 use libloading::{Library, Symbol};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::Instant;
-use tracing::info;
+use std::sync::Arc;
 
-use crate::dmabuf::DmaBufPlane;
-use crate::{CaptureBackendType, CaptureError, DisplayCapture, PixelFormat, RawFrame};
-
-static MONOTONIC_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+use crate::{CaptureBackendType, CaptureError, DisplayCapture, RawFrame};
 
 /// SPA data types for buffer allocation.
 pub const SPA_DATA_MEM_PTR: u32 = 1;
@@ -72,6 +66,26 @@ impl PipeWireCapture {
             }
         }
         false
+    }
+
+    pub fn display_id(&self) -> u16 {
+        self.display_id
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn fps(&self) -> u32 {
+        self.fps
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
 }
 
@@ -138,16 +152,13 @@ impl DisplayCapture for PipeWireCapture {
         }
 
         self._lib = Some(lib);
-        self.initialized = true;
-        self.running.store(true, Ordering::SeqCst);
-        info!(
-            display_id = self.display_id,
-            width = self.width,
-            height = self.height,
-            fps = self.fps,
-            "PipeWire DMA-BUF capture initialized"
-        );
-        Ok(())
+
+        // Screen capture over PipeWire DMA-BUF requires an active portal screencast stream node.
+        // In the absence of an active negotiated stream node, fail initialization cleanly so
+        // that AutoCapture gracefully demotes to SyntheticCapture.
+        Err(CaptureError::InitFailed(
+            "No active PipeWire screencast stream node negotiated".into(),
+        ))
     }
 
     async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
@@ -157,22 +168,9 @@ impl DisplayCapture for PipeWireCapture {
             ));
         }
 
-        let stride = self.width * 4;
-        let pts_us = MONOTONIC_START.elapsed().as_micros() as u64;
-
-        // Valid DMA-BUF plane backed by an in-memory DRM/KMS handle
-        let dma_plane = DmaBufPlane::create_test_memfd(stride, 0, 0);
-
-        Ok(RawFrame {
-            display_id: self.display_id,
-            width: self.width,
-            height: self.height,
-            stride,
-            format: PixelFormat::Bgra8,
-            pts_us,
-            dma_buf: Some(vec![dma_plane]),
-            data: Bytes::new(), // Zero CPU copy
-        })
+        Err(CaptureError::CaptureFailed(
+            "No active PipeWire screencast stream node negotiated".into(),
+        ))
     }
 
     fn backend_type(&self) -> CaptureBackendType {
@@ -201,6 +199,26 @@ impl Drop for PipeWireCapture {
                     self.loop_ptr = std::ptr::null_mut();
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pipewire_capture_without_stream_node_demotes() {
+        let mut pw = PipeWireCapture::new(0, 1920, 1080, 60);
+        assert_eq!(pw.display_id(), 0);
+        assert_eq!(pw.width(), 1920);
+        assert_eq!(pw.height(), 1080);
+        assert_eq!(pw.fps(), 60);
+        assert!(!pw.is_running());
+
+        let res = pw.init().await;
+        if PipeWireCapture::is_available() {
+            assert!(matches!(res, Err(CaptureError::InitFailed(_))));
         }
     }
 }

@@ -130,9 +130,9 @@ async fn test_bidirectional_control_and_input_flow() {
         .await
         .expect("Handle mouse event failed");
 
-    // 3. Client sends Reference Picture Invalidation (RPI) feedback
-    let rpi_frame_id = 7u64;
-    let rpi_payload = Bytes::copy_from_slice(&rpi_frame_id.to_be_bytes());
+    // 3. Client sends Reference Picture Invalidation (RPI) feedback carrying frame pts_us
+    let rpi_pts_us = 602_000u64;
+    let rpi_payload = Bytes::copy_from_slice(&rpi_pts_us.to_be_bytes());
     let rpi_packet = Packet::new(
         PacketHeader::new(
             PacketType::ReferencePictureInvalidation,
@@ -148,6 +148,8 @@ async fn test_bidirectional_control_and_input_flow() {
         .handle_incoming_packet(rpi_packet)
         .await
         .expect("Handle RPI failed");
+
+    assert_eq!(session.encoder().last_rpi_pts(), Some(602_000));
 }
 
 #[tokio::test]

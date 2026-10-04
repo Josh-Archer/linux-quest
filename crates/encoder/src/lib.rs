@@ -48,6 +48,7 @@ pub struct EncodedFrame {
     pub frame_id: u64,
     pub is_keyframe: bool,
     pub is_intra_refresh: bool,
+    pub picture_type: u32,
     pub chunks: Vec<VideoChunk>,
     pub encode_duration_us: u32,
 }
@@ -57,7 +58,7 @@ pub trait VideoEncoder: Send + Sync {
     async fn init(&mut self, config: EncoderConfig) -> Result<(), EncoderError>;
     async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError>;
     fn request_keyframe(&mut self);
-    fn invalidate_reference_picture(&mut self, last_good_frame_id: u64);
+    fn invalidate_reference_picture(&mut self, pts_us: u64);
 }
 
 /// Software mock encoder for testing chunking, rate control, and RPI loops.
@@ -81,6 +82,10 @@ impl MockVideoEncoder {
     pub fn last_rpi_frame(&self) -> Option<u64> {
         self.last_rpi_frame
     }
+
+    pub fn last_rpi_pts(&self) -> Option<u64> {
+        self.last_rpi_frame
+    }
 }
 
 #[async_trait]
@@ -94,7 +99,7 @@ impl VideoEncoder for MockVideoEncoder {
 
     async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError> {
         self.frame_counter += 1;
-        let is_keyframe = self.force_keyframe || (self.frame_counter % 120 == 1);
+        let is_keyframe = self.force_keyframe;
         let is_intra_refresh = !is_keyframe
             && self.config.intra_refresh_period > 0
             && self
@@ -131,10 +136,19 @@ impl VideoEncoder for MockVideoEncoder {
             chunks.push(VideoChunk::new(meta, chunk_data));
         }
 
+        let picture_type = if is_keyframe {
+            3 // IDR
+        } else if is_intra_refresh {
+            6 // Intra Refresh
+        } else {
+            0 // P-frame
+        };
+
         Ok(EncodedFrame {
             frame_id: self.frame_counter,
             is_keyframe,
             is_intra_refresh,
+            picture_type,
             chunks,
             encode_duration_us: 1500, // Simulated 1.5ms
         })
@@ -144,8 +158,8 @@ impl VideoEncoder for MockVideoEncoder {
         self.force_keyframe = true;
     }
 
-    fn invalidate_reference_picture(&mut self, last_good_frame_id: u64) {
-        self.last_rpi_frame = Some(last_good_frame_id);
+    fn invalidate_reference_picture(&mut self, pts_us: u64) {
+        self.last_rpi_frame = Some(pts_us);
     }
 }
 
@@ -194,8 +208,8 @@ impl VideoEncoder for AutoVideoEncoder {
         self.inner.request_keyframe();
     }
 
-    fn invalidate_reference_picture(&mut self, last_good_frame_id: u64) {
-        self.inner.invalidate_reference_picture(last_good_frame_id);
+    fn invalidate_reference_picture(&mut self, pts_us: u64) {
+        self.inner.invalidate_reference_picture(pts_us);
     }
 }
 

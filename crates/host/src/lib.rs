@@ -71,6 +71,14 @@ where
         self.running.clone()
     }
 
+    pub fn encoder(&self) -> &E {
+        &self.encoder
+    }
+
+    pub fn encoder_mut(&mut self) -> &mut E {
+        &mut self.encoder
+    }
+
     /// Initialize capture and encoder backends.
     pub async fn init(
         &mut self,
@@ -142,8 +150,8 @@ where
             }
             PacketType::ReferencePictureInvalidation => {
                 if packet.payload.len() >= 8 {
-                    let frame_id = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
-                    self.encoder.invalidate_reference_picture(frame_id);
+                    let pts_us = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
+                    self.encoder.invalidate_reference_picture(pts_us);
                 }
             }
             PacketType::InputEvent => {

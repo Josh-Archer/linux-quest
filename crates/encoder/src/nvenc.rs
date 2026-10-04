@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use libloading::{Library, Symbol};
-use linux_quest_capture::{PixelFormat, RawFrame};
+use linux_quest_capture::RawFrame;
 use linux_quest_protocol::{VideoChunk, VideoChunkMeta, VideoCodec};
 use std::ffi::c_void;
 use std::time::Instant;
@@ -58,11 +58,15 @@ pub const fn nv_enc_struct_version(ver: u32) -> u32 {
 
 pub const NV_ENC_DEVICE_TYPE_CUDA: u32 = 1;
 pub const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x00000001;
+pub const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x01000000;
+pub const NV_ENC_BUFFER_FORMAT_ABGR: u32 = 0x10000000;
 pub const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
 pub const NV_ENC_PARAMS_RC_CBR: u32 = 2;
 pub const NVENC_INFINITE_GOPLENGTH: u32 = 0xffffffff;
 pub const NV_ENC_PIC_STRUCT_FRAME: u32 = 1;
-pub const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x00000004;
+pub const NV_ENC_PIC_FLAG_FORCEINTRA: u32 = 0x00000001;
+pub const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x00000002;
+pub const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 0x00000004;
 
 pub const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER: u32 = nv_enc_struct_version(1);
 pub const NV_ENC_INITIALIZE_PARAMS_VER: u32 = nv_enc_struct_version(6) | (1 << 31);
@@ -300,6 +304,7 @@ type CuInitFn = unsafe extern "C" fn(u32) -> i32;
 type CuDeviceGetFn = unsafe extern "C" fn(*mut i32, i32) -> i32;
 type CuCtxCreateFn = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
 type CuCtxDestroyFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type CuCtxSetCurrentFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 /// Ultra-low latency hardware encoder leveraging NVIDIA NVENC (RTX 40/50 series dual NVENC).
 pub struct NvencEncoder {
@@ -340,6 +345,48 @@ impl NvencEncoder {
         }
     }
 
+    /// Releases all GPU encoder and CUDA resources cleanly.
+    pub fn cleanup(&mut self) {
+        if let Some(fn_list) = &self.fn_list {
+            unsafe {
+                if !self.input_buffer.is_null() && !fn_list.nv_enc_destroy_input_buffer.is_null() {
+                    let destroy_in: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 =
+                        std::mem::transmute(fn_list.nv_enc_destroy_input_buffer);
+                    let _ = destroy_in(self.encoder, self.input_buffer);
+                    self.input_buffer = std::ptr::null_mut();
+                }
+                if !self.bitstream_buffer.is_null()
+                    && !fn_list.nv_enc_destroy_bitstream_buffer.is_null()
+                {
+                    let destroy_bs: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 =
+                        std::mem::transmute(fn_list.nv_enc_destroy_bitstream_buffer);
+                    let _ = destroy_bs(self.encoder, self.bitstream_buffer);
+                    self.bitstream_buffer = std::ptr::null_mut();
+                }
+                if !self.encoder.is_null() && !fn_list.nv_enc_destroy_encoder.is_null() {
+                    let destroy_enc: unsafe extern "C" fn(*mut c_void) -> u32 =
+                        std::mem::transmute(fn_list.nv_enc_destroy_encoder);
+                    let _ = destroy_enc(self.encoder);
+                    self.encoder = std::ptr::null_mut();
+                }
+            }
+        }
+        if !self.cuda_ctx.is_null() {
+            if let Some(cuda_lib) = &self._cuda_lib {
+                unsafe {
+                    if let Ok(cu_ctx_destroy) = cuda_lib
+                        .get::<CuCtxDestroyFn>(b"cuCtxDestroy_v2\0")
+                        .or_else(|_| cuda_lib.get::<CuCtxDestroyFn>(b"cuCtxDestroy\0"))
+                    {
+                        let _ = cu_ctx_destroy(self.cuda_ctx);
+                    }
+                }
+            }
+            self.cuda_ctx = std::ptr::null_mut();
+        }
+        self.initialized = false;
+    }
+
     /// Checks if NVIDIA NVENC library is dynamically loadable and can report supported version.
     pub fn is_available() -> bool {
         unsafe {
@@ -371,6 +418,8 @@ impl NvencEncoder {
 #[async_trait]
 impl VideoEncoder for NvencEncoder {
     async fn init(&mut self, config: EncoderConfig) -> Result<(), EncoderError> {
+        self.cleanup();
+
         let cuda_lib = unsafe {
             Library::new("libcuda.so.1")
                 .or_else(|_| Library::new("libcuda.so"))
@@ -412,13 +461,19 @@ impl VideoEncoder for NvencEncoder {
                 )));
             }
         }
+        self._cuda_lib = Some(cuda_lib);
+        self.cuda_ctx = cuda_ctx;
 
-        let nvenc_lib = unsafe {
-            Library::new("libnvidia-encode.so.1")
-                .or_else(|_| Library::new("libnvidia-encode.so"))
-                .map_err(|e| {
-                    EncoderError::InitFailed(format!("Failed to load libnvidia-encode: {e}"))
-                })?
+        let nvenc_lib = match unsafe {
+            Library::new("libnvidia-encode.so.1").or_else(|_| Library::new("libnvidia-encode.so"))
+        } {
+            Ok(lib) => lib,
+            Err(e) => {
+                self.cleanup();
+                return Err(EncoderError::InitFailed(format!(
+                    "Failed to load libnvidia-encode: {e}"
+                )));
+            }
         };
 
         let mut fn_list = Box::new(unsafe { std::mem::zeroed::<NvEncodeApiFunctionList>() });
@@ -428,28 +483,40 @@ impl VideoEncoder for NvencEncoder {
         let input_pitch;
 
         unsafe {
-            let get_max_ver: Symbol<NvEncodeApiGetMaxSupportedVersionFn> = nvenc_lib
-                .get(b"NvEncodeAPIGetMaxSupportedVersion\0")
-                .map_err(|e| {
-                    EncoderError::InitFailed(format!(
-                        "NvEncodeAPIGetMaxSupportedVersion lookup: {e}"
-                    ))
-                })?;
+            let get_max_ver: Symbol<NvEncodeApiGetMaxSupportedVersionFn> =
+                match nvenc_lib.get(b"NvEncodeAPIGetMaxSupportedVersion\0") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.cleanup();
+                        return Err(EncoderError::InitFailed(format!(
+                            "NvEncodeAPIGetMaxSupportedVersion lookup: {e}"
+                        )));
+                    }
+                };
             let mut max_version = 0u32;
             let status = get_max_ver(&mut max_version);
             if status != NV_ENC_SUCCESS || max_version < ((12 << 4) | 1) {
+                self.cleanup();
                 return Err(EncoderError::InitFailed(format!(
                     "Unsupported NVENC version: {max_version:#x}"
                 )));
             }
 
-            let create_instance: Symbol<NvEncodeApiCreateInstanceFn> = nvenc_lib
-                .get(b"NvEncodeAPICreateInstance\0")
-                .map_err(|e| EncoderError::InitFailed(format!("Symbol lookup failed: {e}")))?;
+            let create_instance: Symbol<NvEncodeApiCreateInstanceFn> =
+                match nvenc_lib.get(b"NvEncodeAPICreateInstance\0") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.cleanup();
+                        return Err(EncoderError::InitFailed(format!(
+                            "Symbol lookup failed: {e}"
+                        )));
+                    }
+                };
 
             fn_list.version = nv_enc_struct_version(2);
             let status = create_instance(fn_list.as_mut());
             if status != NV_ENC_SUCCESS {
+                self.cleanup();
                 return Err(EncoderError::InitFailed(format!(
                     "NvEncodeAPICreateInstance failed with code {status}"
                 )));
@@ -459,7 +526,7 @@ impl VideoEncoder for NvencEncoder {
             let mut open_params: NvEncOpenEncodeSessionExParams = std::mem::zeroed();
             open_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
             open_params.device_type = NV_ENC_DEVICE_TYPE_CUDA;
-            open_params.device = cuda_ctx;
+            open_params.device = self.cuda_ctx;
             open_params.api_version = NVENCAPI_VERSION;
 
             let open_session_ex: unsafe extern "C" fn(
@@ -468,10 +535,17 @@ impl VideoEncoder for NvencEncoder {
             ) -> u32 = std::mem::transmute(fn_list.nv_enc_open_encode_session_ex);
             let status = open_session_ex(&mut open_params, &mut encoder);
             if status != NV_ENC_SUCCESS || encoder.is_null() {
+                self.cleanup();
                 return Err(EncoderError::InitFailed(format!(
                     "NvEncOpenEncodeSessionEx failed with code {status}"
                 )));
             }
+
+            self._nvenc_lib = Some(nvenc_lib);
+            self.fn_list = Some(fn_list);
+            self.encoder = encoder;
+
+            let fn_list = self.fn_list.as_ref().unwrap();
 
             // Query Preset Config Ex (P1 Preset with Ultra Low Latency tuning)
             let codec_guid = match config.codec {
@@ -492,19 +566,20 @@ impl VideoEncoder for NvencEncoder {
                 *mut NvEncPresetConfig,
             ) -> u32 = std::mem::transmute(fn_list.nv_enc_get_encode_preset_config_ex);
             let status = get_preset_config_ex(
-                encoder,
+                self.encoder,
                 codec_guid,
                 NV_ENC_PRESET_P1_GUID,
                 NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &mut preset_cfg,
             );
             if status != NV_ENC_SUCCESS {
+                self.cleanup();
                 return Err(EncoderError::InitFailed(format!(
                     "NvEncGetEncodePresetConfigEx failed with code {status}"
                 )));
             }
 
-            // Override low-latency rate control: CBR, 1-frame VBV, zero reorder delay, infinite GOP, intra-refresh
+            // Override low-latency rate control: CBR, 1-frame VBV, zero reorder delay (SDK 12.1 bit 9), infinite GOP, intra-refresh
             preset_cfg.preset_cfg.gop_length = NVENC_INFINITE_GOPLENGTH;
             preset_cfg.preset_cfg.frame_interval_p = 1;
             preset_cfg.preset_cfg.rc_params.rate_control_mode = NV_ENC_PARAMS_RC_CBR;
@@ -513,7 +588,7 @@ impl VideoEncoder for NvencEncoder {
             let vbv_buffer_size = average_bit_rate / config.fps.max(1);
             preset_cfg.preset_cfg.rc_params.vbv_buffer_size = vbv_buffer_size;
             preset_cfg.preset_cfg.rc_params.vbv_initial_delay = vbv_buffer_size;
-            preset_cfg.preset_cfg.rc_params.bitfields = 1 << 6; // zeroReorderDelay = 1
+            preset_cfg.preset_cfg.rc_params.bitfields |= 0x200; // zeroReorderDelay = 1 (bit 9 in SDK 12.1)
 
             let intra_period = config.intra_refresh_period.max(1);
             let intra_cnt = (config.intra_refresh_period / 8).clamp(1, 10);
@@ -521,30 +596,22 @@ impl VideoEncoder for NvencEncoder {
             let codec_raw = &mut preset_cfg.preset_cfg.encode_codec_config.raw;
             match config.codec {
                 VideoCodec::Av1 => {
-                    // bitfields at offset 16: enableIntraRefresh (1 << 6), chromaFormatIDC=1 (1 << 7)
-                    let bitfields = (1u32 << 6) | (1u32 << 7);
+                    let mut bitfields = u32::from_ne_bytes(codec_raw[16..20].try_into().unwrap());
+                    bitfields |= 0x2e0; // repeatSeqHdr(0x20) | enableIntraRefresh(0x40) | chromaFormatIDC=1(0x80) | enableBitstreamPadding(0x200)
                     codec_raw[16..20].copy_from_slice(&bitfields.to_ne_bytes());
-                    // idrPeriod at offset 20
                     codec_raw[20..24].copy_from_slice(&NVENC_INFINITE_GOPLENGTH.to_ne_bytes());
-                    // intraRefreshPeriod at offset 24
                     codec_raw[24..28].copy_from_slice(&intra_period.to_ne_bytes());
-                    // intraRefreshCnt at offset 28
                     codec_raw[28..32].copy_from_slice(&intra_cnt.to_ne_bytes());
-                    // maxNumRefFramesInDPB at offset 32
-                    codec_raw[32..36].copy_from_slice(&8u32.to_ne_bytes());
+                    codec_raw[32..36].copy_from_slice(&1u32.to_ne_bytes()); // maxNumRefFramesInDPB = 1
                 }
                 VideoCodec::Hevc => {
-                    // bitfields at offset 16: enableIntraRefresh (1 << 10), chromaFormatIDC=1 (1 << 11)
-                    let bitfields = (1u32 << 10) | (1u32 << 11);
+                    let mut bitfields = u32::from_ne_bytes(codec_raw[16..20].try_into().unwrap());
+                    bitfields |= 0x4380; // repeatSPSPPS(0x80) | enableIntraRefresh(0x100) | chromaFormatIDC=1(0x200) | enableFillerDataInsertion(0x4000)
                     codec_raw[16..20].copy_from_slice(&bitfields.to_ne_bytes());
-                    // idrPeriod at offset 20
                     codec_raw[20..24].copy_from_slice(&NVENC_INFINITE_GOPLENGTH.to_ne_bytes());
-                    // intraRefreshPeriod at offset 24
                     codec_raw[24..28].copy_from_slice(&intra_period.to_ne_bytes());
-                    // intraRefreshCnt at offset 28
                     codec_raw[28..32].copy_from_slice(&intra_cnt.to_ne_bytes());
-                    // maxNumRefFramesInDPB at offset 32
-                    codec_raw[32..36].copy_from_slice(&8u32.to_ne_bytes());
+                    codec_raw[32..36].copy_from_slice(&1u32.to_ne_bytes()); // maxNumRefFramesInDPB = 1
                 }
                 _ => {}
             }
@@ -562,12 +629,14 @@ impl VideoEncoder for NvencEncoder {
             init_params.frame_rate_den = 1;
             init_params.enable_ptd = 1;
             init_params.tuning_info = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+            init_params.buffer_format = NV_ENC_BUFFER_FORMAT_ARGB;
             init_params.encode_config = &mut preset_cfg.preset_cfg;
 
             let init_encoder: unsafe extern "C" fn(*mut c_void, *mut NvEncInitializeParams) -> u32 =
                 std::mem::transmute(fn_list.nv_enc_initialize_encoder);
-            let status = init_encoder(encoder, &mut init_params);
+            let status = init_encoder(self.encoder, &mut init_params);
             if status != NV_ENC_SUCCESS {
+                self.cleanup();
                 return Err(EncoderError::InitFailed(format!(
                     "NvEncInitializeEncoder failed with code {status}"
                 )));
@@ -578,19 +647,21 @@ impl VideoEncoder for NvencEncoder {
             in_buf_params.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
             in_buf_params.width = config.width;
             in_buf_params.height = config.height;
-            in_buf_params.buffer_fmt = NV_ENC_BUFFER_FORMAT_NV12;
+            in_buf_params.buffer_fmt = NV_ENC_BUFFER_FORMAT_ARGB;
 
             let create_input_buffer: unsafe extern "C" fn(
                 *mut c_void,
                 *mut NvEncCreateInputBuffer,
             ) -> u32 = std::mem::transmute(fn_list.nv_enc_create_input_buffer);
-            let status = create_input_buffer(encoder, &mut in_buf_params);
+            let status = create_input_buffer(self.encoder, &mut in_buf_params);
             if status != NV_ENC_SUCCESS {
+                self.cleanup();
                 return Err(EncoderError::InitFailed(format!(
                     "NvEncCreateInputBuffer failed with code {status}"
                 )));
             }
             input_buffer = in_buf_params.input_buffer;
+            self.input_buffer = input_buffer;
 
             // Create Bitstream Buffer
             let mut out_buf_params: NvEncCreateBitstreamBuffer = std::mem::zeroed();
@@ -600,13 +671,15 @@ impl VideoEncoder for NvencEncoder {
                 *mut c_void,
                 *mut NvEncCreateBitstreamBuffer,
             ) -> u32 = std::mem::transmute(fn_list.nv_enc_create_bitstream_buffer);
-            let status = create_bitstream_buffer(encoder, &mut out_buf_params);
+            let status = create_bitstream_buffer(self.encoder, &mut out_buf_params);
             if status != NV_ENC_SUCCESS {
+                self.cleanup();
                 return Err(EncoderError::InitFailed(format!(
                     "NvEncCreateBitstreamBuffer failed with code {status}"
                 )));
             }
             bitstream_buffer = out_buf_params.bitstream_buffer;
+            self.bitstream_buffer = bitstream_buffer;
 
             // Pre-calculate pitch by locking input buffer once
             let mut lock_in: NvEncLockInputBuffer = std::mem::zeroed();
@@ -614,25 +687,18 @@ impl VideoEncoder for NvencEncoder {
             lock_in.input_buffer = input_buffer;
             let lock_in_fn: unsafe extern "C" fn(*mut c_void, *mut NvEncLockInputBuffer) -> u32 =
                 std::mem::transmute(fn_list.nv_enc_lock_input_buffer);
-            if lock_in_fn(encoder, &mut lock_in) == NV_ENC_SUCCESS {
+            if lock_in_fn(self.encoder, &mut lock_in) == NV_ENC_SUCCESS {
                 input_pitch = lock_in.pitch;
                 let unlock_in_fn: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 =
                     std::mem::transmute(fn_list.nv_enc_unlock_input_buffer);
-                unlock_in_fn(encoder, input_buffer);
+                unlock_in_fn(self.encoder, input_buffer);
             } else {
-                input_pitch = config.width;
+                input_pitch = config.width * 4;
             }
         }
 
         self.config = config;
-        self._cuda_lib = Some(cuda_lib);
-        self._nvenc_lib = Some(nvenc_lib);
-        self.fn_list = Some(fn_list);
-        self.cuda_ctx = cuda_ctx;
-        self.encoder = encoder;
-        self.input_buffer = input_buffer;
         self.input_pitch = input_pitch;
-        self.bitstream_buffer = bitstream_buffer;
         self.initialized = true;
         self.frame_counter = 0;
         self.force_keyframe = true;
@@ -655,21 +721,26 @@ impl VideoEncoder for NvencEncoder {
             return Err(EncoderError::EncodeFailed("Encoder not initialized".into()));
         }
 
+        if let Some(cuda_lib) = &self._cuda_lib {
+            unsafe {
+                if let Ok(cu_ctx_set_current) =
+                    cuda_lib.get::<CuCtxSetCurrentFn>(b"cuCtxSetCurrent\0")
+                {
+                    let _ = cu_ctx_set_current(self.cuda_ctx);
+                }
+            }
+        }
+
         let encode_start = Instant::now();
         self.frame_counter += 1;
 
-        let is_keyframe = self.force_keyframe;
-        let is_intra_refresh = !is_keyframe
-            && self.config.intra_refresh_period > 0
-            && self
-                .frame_counter
-                .is_multiple_of(self.config.intra_refresh_period as u64);
+        let is_keyframe_req = self.force_keyframe;
         self.force_keyframe = false;
 
         let fn_list = self.fn_list.as_ref().unwrap();
         let encoder = self.encoder;
 
-        // Lock Input Buffer and upload frame pixels
+        // Lock Input Buffer and upload frame pixels (ARGB format)
         unsafe {
             let mut lock_in: NvEncLockInputBuffer = std::mem::zeroed();
             lock_in.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
@@ -693,53 +764,26 @@ impl VideoEncoder for NvencEncoder {
 
             if !frame.data.is_empty() {
                 let src = &frame.data;
-                let dst = std::slice::from_raw_parts_mut(buf_ptr, pitch * height * 3 / 2);
+                let dst = std::slice::from_raw_parts_mut(buf_ptr, pitch * height);
                 let src_stride = frame.stride as usize;
-                let is_bgra = frame.format == PixelFormat::Bgra8;
+                let row_bytes = (width * 4).min(src_stride);
 
-                // Y plane
-                for y in 0..height {
-                    let src_row = y * src_stride;
-                    let dst_row = y * pitch;
-                    for x in 0..width {
-                        let px = src_row + x * 4;
-                        if px + 2 < src.len() {
-                            let (r, g, b) = if is_bgra {
-                                (src[px + 2] as i32, src[px + 1] as i32, src[px] as i32)
-                            } else {
-                                (src[px] as i32, src[px + 1] as i32, src[px + 2] as i32)
-                            };
-                            let y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                            dst[dst_row + x] = y_val.clamp(16, 235) as u8;
-                        }
-                    }
-                }
-
-                // UV interleaved plane
-                let uv_offset = pitch * height;
-                for y in (0..height).step_by(2) {
-                    let src_row = y * src_stride;
-                    let dst_row = uv_offset + (y / 2) * pitch;
-                    for x in (0..width).step_by(2) {
-                        let px = src_row + x * 4;
-                        if px + 2 < src.len() {
-                            let (r, g, b) = if is_bgra {
-                                (src[px + 2] as i32, src[px + 1] as i32, src[px] as i32)
-                            } else {
-                                (src[px] as i32, src[px + 1] as i32, src[px + 2] as i32)
-                            };
-                            let u_val = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                            let v_val = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                            dst[dst_row + x] = u_val.clamp(16, 240) as u8;
-                            dst[dst_row + x + 1] = v_val.clamp(16, 240) as u8;
+                if src_stride == pitch && row_bytes == pitch && src.len() >= pitch * height {
+                    dst[..pitch * height].copy_from_slice(&src[..pitch * height]);
+                } else {
+                    for y in 0..height {
+                        let src_start = y * src_stride;
+                        let dst_start = y * pitch;
+                        if src_start + row_bytes <= src.len() && dst_start + row_bytes <= dst.len()
+                        {
+                            dst[dst_start..dst_start + row_bytes]
+                                .copy_from_slice(&src[src_start..src_start + row_bytes]);
                         }
                     }
                 }
             } else {
-                // Neutral YUV fill for zero-copy DMA-BUF frame
-                let dst = std::slice::from_raw_parts_mut(buf_ptr, pitch * height * 3 / 2);
-                dst[..pitch * height].fill(0x10);
-                dst[pitch * height..].fill(0x80);
+                let dst = std::slice::from_raw_parts_mut(buf_ptr, pitch * height);
+                dst.fill(0);
             }
 
             let unlock_input_buffer: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 =
@@ -754,10 +798,10 @@ impl VideoEncoder for NvencEncoder {
             pic.input_pitch = lock_in.pitch;
             pic.input_buffer = self.input_buffer;
             pic.output_bitstream = self.bitstream_buffer;
-            pic.buffer_fmt = NV_ENC_BUFFER_FORMAT_NV12;
+            pic.buffer_fmt = NV_ENC_BUFFER_FORMAT_ARGB;
             pic.picture_struct = NV_ENC_PIC_STRUCT_FRAME;
-            if is_keyframe {
-                pic.encode_pic_flags = NV_ENC_PIC_FLAG_FORCEIDR;
+            if is_keyframe_req {
+                pic.encode_pic_flags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
             }
             pic.input_time_stamp = frame.pts_us;
 
@@ -790,6 +834,15 @@ impl VideoEncoder for NvencEncoder {
             );
             let encoded_payload = Bytes::copy_from_slice(bitstream_bytes);
 
+            let pic_type = lock_bs.picture_type;
+            let is_keyframe = pic_type == 3 || pic_type == 2 || is_keyframe_req;
+            let is_intra_refresh = pic_type == 6
+                || (!is_keyframe
+                    && self.config.intra_refresh_period > 0
+                    && self
+                        .frame_counter
+                        .is_multiple_of(self.config.intra_refresh_period as u64));
+
             let unlock_bitstream: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 =
                 std::mem::transmute(fn_list.nv_enc_unlock_bitstream);
             unlock_bitstream(encoder, self.bitstream_buffer);
@@ -820,6 +873,7 @@ impl VideoEncoder for NvencEncoder {
                 frame_id: self.frame_counter,
                 is_keyframe,
                 is_intra_refresh,
+                picture_type: pic_type,
                 chunks,
                 encode_duration_us: encode_duration_us.max(1),
             })
@@ -846,49 +900,14 @@ impl VideoEncoder for NvencEncoder {
 
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
-        if let Some(fn_list) = &self.fn_list {
-            unsafe {
-                if !self.input_buffer.is_null() && !fn_list.nv_enc_destroy_input_buffer.is_null() {
-                    let destroy_in: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 =
-                        std::mem::transmute(fn_list.nv_enc_destroy_input_buffer);
-                    let _ = destroy_in(self.encoder, self.input_buffer);
-                    self.input_buffer = std::ptr::null_mut();
-                }
-                if !self.bitstream_buffer.is_null()
-                    && !fn_list.nv_enc_destroy_bitstream_buffer.is_null()
-                {
-                    let destroy_bs: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 =
-                        std::mem::transmute(fn_list.nv_enc_destroy_bitstream_buffer);
-                    let _ = destroy_bs(self.encoder, self.bitstream_buffer);
-                    self.bitstream_buffer = std::ptr::null_mut();
-                }
-                if !self.encoder.is_null() && !fn_list.nv_enc_destroy_encoder.is_null() {
-                    let destroy_enc: unsafe extern "C" fn(*mut c_void) -> u32 =
-                        std::mem::transmute(fn_list.nv_enc_destroy_encoder);
-                    let _ = destroy_enc(self.encoder);
-                    self.encoder = std::ptr::null_mut();
-                }
-            }
-        }
-        if !self.cuda_ctx.is_null() {
-            if let Some(cuda_lib) = &self._cuda_lib {
-                unsafe {
-                    if let Ok(cu_ctx_destroy) = cuda_lib
-                        .get::<CuCtxDestroyFn>(b"cuCtxDestroy_v2\0")
-                        .or_else(|_| cuda_lib.get::<CuCtxDestroyFn>(b"cuCtxDestroy\0"))
-                    {
-                        let _ = cu_ctx_destroy(self.cuda_ctx);
-                    }
-                }
-            }
-            self.cuda_ctx = std::ptr::null_mut();
-        }
+        self.cleanup();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use linux_quest_capture::PixelFormat;
 
     #[test]
     fn test_nvenc_codec_guid_resolution() {
@@ -923,7 +942,7 @@ mod tests {
             width: 1280,
             height: 720,
             fps: 60,
-            bitrate_kbps: 20_000,
+            bitrate_kbps: 60_000,
             intra_refresh_period: 60,
             max_chunk_size: 1400,
         });
@@ -934,14 +953,14 @@ mod tests {
                 width: 1280,
                 height: 720,
                 fps: 60,
-                bitrate_kbps: 20_000,
+                bitrate_kbps: 60_000,
                 intra_refresh_period: 60,
                 max_chunk_size: 1400,
             })
             .await
-            .expect("Hardware NVENC init failed on available device");
+            .expect("Hardware NVENC AV1 init failed on available device");
 
-        let frame = RawFrame {
+        let frame1 = RawFrame {
             display_id: 0,
             width: 1280,
             height: 720,
@@ -952,21 +971,111 @@ mod tests {
             data: Bytes::from(vec![128u8; 1280 * 720 * 4]),
         };
 
-        let encoded = encoder.encode(&frame).await.expect("Encode failed");
-        assert_eq!(encoded.frame_id, 1);
-        assert!(encoded.is_keyframe);
-        assert!(!encoded.chunks.is_empty());
-        assert!(encoded.encode_duration_us > 0);
+        // Frame 1: initial frame must be IDR (picture_type == 3)
+        let encoded1 = encoder
+            .encode(&frame1)
+            .await
+            .expect("Encode frame 1 failed");
+        assert_eq!(encoded1.frame_id, 1);
+        assert!(encoded1.is_keyframe);
+        assert_eq!(encoded1.picture_type, 3);
+        assert!(!encoded1.chunks.is_empty());
+        assert!(
+            encoded1.encode_duration_us < 3000,
+            "Encode duration {} us exceeds 3ms budget",
+            encoded1.encode_duration_us
+        );
 
-        // Verify the bitstream starts with a valid AV1 OBU (Temporal Delimiter or Sequence Header)
-        let first_chunk = &encoded.chunks[0];
-        let payload = &first_chunk.payload;
-        assert!(payload.len() >= 4);
-        let obu_type = (payload[0] >> 3) & 0x0f;
-        // OBU types: 1 = Sequence Header, 2 = Temporal Delimiter
+        // Verify CBR bitstream padding (> 50,000 bytes at 60 Mbps CBR)
+        let total_size: usize = encoded1.chunks.iter().map(|c| c.payload.len()).sum();
+        assert!(
+            total_size > 50_000,
+            "CBR padding failed: total size {total_size} bytes <= 50,000"
+        );
+
+        // Verify AV1 Sequence Header or Temporal Delimiter OBU
+        let first_payload = &encoded1.chunks[0].payload;
+        assert!(first_payload.len() >= 4);
+        let obu_type = (first_payload[0] >> 3) & 0x0f;
         assert!(
             obu_type == 1 || obu_type == 2,
-            "Expected AV1 Sequence Header or Temporal Delimiter OBU, got type {obu_type}"
+            "Expected AV1 Seq Header or Temporal Delimiter, got {obu_type}"
         );
+
+        // Frame 2: regular frame (non-keyframe)
+        let frame2 = RawFrame {
+            display_id: 0,
+            width: 1280,
+            height: 720,
+            stride: 1280 * 4,
+            format: PixelFormat::Bgra8,
+            pts_us: 2000,
+            dma_buf: None,
+            data: Bytes::from(vec![130u8; 1280 * 720 * 4]),
+        };
+        let encoded2 = encoder
+            .encode(&frame2)
+            .await
+            .expect("Encode frame 2 failed");
+        assert_eq!(encoded2.frame_id, 2);
+        assert!(!encoded2.is_keyframe);
+        assert_ne!(encoded2.picture_type, 3);
+
+        // Frame 3: explicit keyframe request
+        encoder.request_keyframe();
+        let frame3 = RawFrame {
+            display_id: 0,
+            width: 1280,
+            height: 720,
+            stride: 1280 * 4,
+            format: PixelFormat::Bgra8,
+            pts_us: 3000,
+            dma_buf: None,
+            data: Bytes::from(vec![132u8; 1280 * 720 * 4]),
+        };
+        let encoded3 = encoder
+            .encode(&frame3)
+            .await
+            .expect("Encode frame 3 failed");
+        assert_eq!(encoded3.frame_id, 3);
+        assert!(encoded3.is_keyframe);
+        assert_eq!(encoded3.picture_type, 3);
+
+        // Invalidate reference picture test
+        encoder.invalidate_reference_picture(3000);
+        assert_eq!(encoder.last_rpi_frame, Some(3000));
+
+        // Test HEVC hardware session initialization and encode
+        let mut hevc_encoder = NvencEncoder::new(EncoderConfig {
+            codec: VideoCodec::Hevc,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_kbps: 60_000,
+            intra_refresh_period: 60,
+            max_chunk_size: 1400,
+        });
+
+        hevc_encoder
+            .init(EncoderConfig {
+                codec: VideoCodec::Hevc,
+                width: 1280,
+                height: 720,
+                fps: 60,
+                bitrate_kbps: 60_000,
+                intra_refresh_period: 60,
+                max_chunk_size: 1400,
+            })
+            .await
+            .expect("HEVC hardware NVENC init must succeed with status 0");
+
+        let hevc_frame = hevc_encoder
+            .encode(&frame1)
+            .await
+            .expect("HEVC encode failed");
+        assert_eq!(hevc_frame.frame_id, 1);
+        assert!(hevc_frame.is_keyframe);
+        assert_eq!(hevc_frame.picture_type, 3);
+        assert!(hevc_frame.encode_duration_us < 3000);
     }
 }
