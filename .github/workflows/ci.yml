@@ -40,6 +40,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        run: |
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install --no-install-recommends -y build-essential
+          fi
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
