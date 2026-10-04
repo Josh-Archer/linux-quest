@@ -129,20 +129,26 @@ impl DisplayCapture for PipeWireCapture {
             let pw_loop = pw_main_loop_get_loop(loop_ptr);
             let ctx_ptr = pw_context_new(pw_loop, std::ptr::null_mut(), 0);
             if ctx_ptr.is_null() {
-                let pw_main_loop_destroy: Symbol<PwMainLoopDestroyFn> =
-                    lib.get(b"pw_main_loop_destroy\0").unwrap();
-                pw_main_loop_destroy(loop_ptr);
+                if let Ok(pw_main_loop_destroy) =
+                    lib.get::<PwMainLoopDestroyFn>(b"pw_main_loop_destroy\0")
+                {
+                    pw_main_loop_destroy(loop_ptr);
+                }
                 return Err(CaptureError::InitFailed("pw_context_new failed".into()));
             }
 
             let core_ptr = pw_context_connect(ctx_ptr, std::ptr::null_mut(), 0);
             if core_ptr.is_null() {
-                let pw_context_destroy: Symbol<PwContextDestroyFn> =
-                    lib.get(b"pw_context_destroy\0").unwrap();
-                let pw_main_loop_destroy: Symbol<PwMainLoopDestroyFn> =
-                    lib.get(b"pw_main_loop_destroy\0").unwrap();
-                pw_context_destroy(ctx_ptr);
-                pw_main_loop_destroy(loop_ptr);
+                if let Ok(pw_context_destroy) =
+                    lib.get::<PwContextDestroyFn>(b"pw_context_destroy\0")
+                {
+                    pw_context_destroy(ctx_ptr);
+                }
+                if let Ok(pw_main_loop_destroy) =
+                    lib.get::<PwMainLoopDestroyFn>(b"pw_main_loop_destroy\0")
+                {
+                    pw_main_loop_destroy(loop_ptr);
+                }
                 return Err(CaptureError::InitFailed("pw_context_connect failed".into()));
             }
 

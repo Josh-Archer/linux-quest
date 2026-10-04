@@ -105,9 +105,9 @@ impl DisplayCapture for SyntheticCapture {
         let mut buffer = vec![0u8; frame_size];
         let offset = (self.frame_counter % 256) as u8;
         for i in (0..frame_size).step_by(4) {
-            buffer[i] = offset; // R
+            buffer[i] = 255 - offset; // B
             buffer[i + 1] = 128; // G
-            buffer[i + 2] = 255 - offset; // B
+            buffer[i + 2] = offset; // R
             buffer[i + 3] = 255; // A
         }
 
@@ -119,7 +119,7 @@ impl DisplayCapture for SyntheticCapture {
             width: self.width,
             height: self.height,
             stride,
-            format: PixelFormat::Rgba8,
+            format: PixelFormat::Bgra8,
             pts_us,
             dma_buf: None,
             data: Bytes::from(buffer),
@@ -203,6 +203,7 @@ mod tests {
         assert_eq!(frame1.width, 1920);
         assert_eq!(frame1.height, 1080);
         assert_eq!(frame1.stride, 1920 * 4);
+        assert_eq!(frame1.format, PixelFormat::Bgra8);
         assert_eq!(frame1.data.len(), 1920 * 1080 * 4);
         assert!(!frame1.is_zero_copy());
 

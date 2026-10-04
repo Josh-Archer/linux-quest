@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use libloading::{Library, Symbol};
-use linux_quest_capture::RawFrame;
+use linux_quest_capture::{PixelFormat, RawFrame};
 use linux_quest_protocol::{VideoChunk, VideoChunkMeta, VideoCodec};
 use std::ffi::c_void;
 use std::time::Instant;
@@ -735,7 +735,6 @@ impl VideoEncoder for NvencEncoder {
         self.frame_counter += 1;
 
         let is_keyframe_req = self.force_keyframe;
-        self.force_keyframe = false;
 
         let fn_list = self.fn_list.as_ref().unwrap();
         let encoder = self.encoder;
@@ -768,7 +767,26 @@ impl VideoEncoder for NvencEncoder {
                 let src_stride = frame.stride as usize;
                 let row_bytes = (width * 4).min(src_stride);
 
-                if src_stride == pitch && row_bytes == pitch && src.len() >= pitch * height {
+                if frame.format == PixelFormat::Rgba8 {
+                    // Convert RGBA -> BGRA (swap R and B channels into ARGB input buffer)
+                    for y in 0..height {
+                        let src_start = y * src_stride;
+                        let dst_start = y * pitch;
+                        if src_start + row_bytes <= src.len() && dst_start + row_bytes <= dst.len()
+                        {
+                            let src_row = &src[src_start..src_start + row_bytes];
+                            let dst_row = &mut dst[dst_start..dst_start + row_bytes];
+                            for x in (0..row_bytes).step_by(4) {
+                                if x + 3 < row_bytes {
+                                    dst_row[x] = src_row[x + 2]; // B <- R
+                                    dst_row[x + 1] = src_row[x + 1]; // G <- G
+                                    dst_row[x + 2] = src_row[x]; // R <- B
+                                    dst_row[x + 3] = src_row[x + 3]; // A <- A
+                                }
+                            }
+                        }
+                    }
+                } else if src_stride == pitch && row_bytes == pitch && src.len() >= pitch * height {
                     dst[..pitch * height].copy_from_slice(&src[..pitch * height]);
                 } else {
                     for y in 0..height {
@@ -867,6 +885,10 @@ impl VideoEncoder for NvencEncoder {
                     pts_us: frame.pts_us,
                 };
                 chunks.push(VideoChunk::new(meta, slice.to_vec().into()));
+            }
+
+            if is_keyframe_req {
+                self.force_keyframe = false;
             }
 
             Ok(EncodedFrame {
@@ -1044,6 +1066,23 @@ mod tests {
         // Invalidate reference picture test
         encoder.invalidate_reference_picture(3000);
         assert_eq!(encoder.last_rpi_frame, Some(3000));
+
+        // Frame 4: RGBA8 format frame testing channel conversion to ARGB buffer
+        let frame4 = RawFrame {
+            display_id: 0,
+            width: 1280,
+            height: 720,
+            stride: 1280 * 4,
+            format: PixelFormat::Rgba8,
+            pts_us: 4000,
+            dma_buf: None,
+            data: Bytes::from(vec![200u8; 1280 * 720 * 4]),
+        };
+        let encoded4 = encoder
+            .encode(&frame4)
+            .await
+            .expect("Encode frame 4 (Rgba8) failed");
+        assert_eq!(encoded4.frame_id, 4);
 
         // Test HEVC hardware session initialization and encode
         let mut hevc_encoder = NvencEncoder::new(EncoderConfig {
