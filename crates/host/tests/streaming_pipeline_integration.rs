@@ -26,6 +26,19 @@ async fn test_full_pipeline_multi_frame_streaming_and_reassembly() {
     let input = MockInputInjector::new();
 
     let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+    session
+        .init(EncoderConfig {
+            codec: VideoCodec::Av1,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 50_000,
+            intra_refresh_period: 5,
+            max_chunk_size: 1024,
+        })
+        .await
+        .expect("Session init failed");
+
     let mut reassembler = FrameReassembler::new(8);
 
     // Stream 10 consecutive frames
@@ -68,6 +81,10 @@ async fn test_bidirectional_control_and_input_flow() {
     let input = MockInputInjector::new();
 
     let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+    session
+        .init(EncoderConfig::default())
+        .await
+        .expect("Session init failed");
 
     // 1. Client sends Ping, Host responds with Pong
     let ping_payload = Bytes::from_static(b"latency-probe-timestamp");
@@ -163,4 +180,19 @@ async fn test_auto_hardware_pipeline_stream() {
 
     let packet = ep_client.recv_packet().await.expect("Client recv failed");
     assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
+    assert_ne!(packet.header.flags & linux_quest_protocol::FLAG_KEYFRAME, 0);
+
+    let chunk = VideoChunk::deserialize(&packet.payload).expect("Chunk deserialization failed");
+    assert_eq!(chunk.meta.frame_id, 1);
+    assert!(chunk.meta.is_keyframe);
+    assert_eq!(chunk.meta.codec, VideoCodec::Av1);
+    assert!(!chunk.payload.is_empty());
+
+    if linux_quest_encoder::NvencEncoder::is_available() {
+        let obu_type = (chunk.payload[0] >> 3) & 0x0f;
+        assert!(
+            obu_type == 1 || obu_type == 2,
+            "Hardware AV1 stream must start with Sequence Header or Temporal Delimiter OBU, got {obu_type}"
+        );
+    }
 }

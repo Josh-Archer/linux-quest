@@ -26,6 +26,9 @@ pub enum HostError {
 
     #[error("Input error: {0}")]
     Input(#[from] linux_quest_input::InputError),
+
+    #[error("Session is not running")]
+    NotRunning,
 }
 
 /// Host session managing the streaming lifecycle for a single display.
@@ -74,13 +77,19 @@ where
         config: linux_quest_encoder::EncoderConfig,
     ) -> Result<(), HostError> {
         self.capture.init().await?;
-        self.encoder.init(config).await?;
+        if let Err(e) = self.encoder.init(config).await {
+            self.running.store(false, Ordering::SeqCst);
+            return Err(HostError::Encoder(e));
+        }
         self.running.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     /// Process one frame: Capture -> Hardware Encode -> Packetize -> Transport Send.
     pub async fn step_stream_frame(&mut self) -> Result<u64, HostError> {
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(HostError::NotRunning);
+        }
         let raw_frame = self.capture.capture_frame().await?;
         let encoded = self.encoder.encode(&raw_frame).await?;
 
@@ -168,6 +177,10 @@ mod tests {
         let input = MockInputInjector::new();
 
         let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+        session
+            .init(EncoderConfig::default())
+            .await
+            .expect("HostStreamSession init failed");
 
         let frame_id = session
             .step_stream_frame()
@@ -178,6 +191,25 @@ mod tests {
         // Client receives packets
         let packet = ep_client.recv_packet().await.expect("Recv failed");
         assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
+    }
+
+    #[tokio::test]
+    async fn test_host_stream_not_running_guard() {
+        let capture = SyntheticCapture::new(0, 1920, 1080, 60);
+        let encoder = MockVideoEncoder::new(EncoderConfig::default());
+        let (ep_host, _) = LoopbackEndpoint::create_pair();
+        let input = MockInputInjector::new();
+
+        let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+        // Before calling init(), step_stream_frame should return NotRunning error
+        let err = session
+            .step_stream_frame()
+            .await
+            .expect_err("Should fail when not running");
+        match err {
+            HostError::NotRunning => (),
+            other => panic!("Expected HostError::NotRunning, got {:?}", other),
+        }
     }
 
     #[tokio::test]

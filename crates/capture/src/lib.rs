@@ -41,7 +41,7 @@ pub enum CaptureBackendType {
 /// A captured raw frame prior to video encoding.
 /// If `dma_buf` is `Some`, the frame is held in GPU VRAM (strictly zero-copy).
 /// If `dma_buf` is `None`, `data` contains system RAM pixels (software fallback/synthetic).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RawFrame {
     pub display_id: u16,
     pub width: u32,
@@ -55,7 +55,10 @@ pub struct RawFrame {
 
 impl RawFrame {
     pub fn is_zero_copy(&self) -> bool {
-        self.dma_buf.is_some()
+        match &self.dma_buf {
+            Some(planes) if !planes.is_empty() => planes.iter().all(|p| p.is_valid()),
+            _ => false,
+        }
     }
 }
 
@@ -130,19 +133,26 @@ impl DisplayCapture for SyntheticCapture {
 
 /// Dynamically discovers and initializes the best available capture engine.
 pub struct AutoCapture {
+    display_id: u16,
+    width: u32,
+    height: u32,
+    fps: u32,
     inner: Box<dyn DisplayCapture>,
 }
 
 impl AutoCapture {
     pub fn new(display_id: u16, width: u32, height: u32, fps: u32) -> Self {
-        if PipeWireCapture::is_available() {
-            Self {
-                inner: Box::new(PipeWireCapture::new(display_id, width, height, fps)),
-            }
+        let inner: Box<dyn DisplayCapture> = if PipeWireCapture::is_available() {
+            Box::new(PipeWireCapture::new(display_id, width, height, fps))
         } else {
-            Self {
-                inner: Box::new(SyntheticCapture::new(display_id, width, height, fps)),
-            }
+            Box::new(SyntheticCapture::new(display_id, width, height, fps))
+        };
+        Self {
+            display_id,
+            width,
+            height,
+            fps,
+            inner,
         }
     }
 }
@@ -150,7 +160,19 @@ impl AutoCapture {
 #[async_trait]
 impl DisplayCapture for AutoCapture {
     async fn init(&mut self) -> Result<(), CaptureError> {
-        self.inner.init().await
+        match self.inner.init().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "Primary capture backend failed to initialize: {e}. Gracefully demoting to SyntheticCapture"
+                );
+                let mut fallback =
+                    SyntheticCapture::new(self.display_id, self.width, self.height, self.fps);
+                fallback.init().await?;
+                self.inner = Box::new(fallback);
+                Ok(())
+            }
+        }
     }
 
     async fn capture_frame(&mut self) -> Result<RawFrame, CaptureError> {
@@ -193,11 +215,44 @@ mod tests {
 
     #[test]
     fn test_dmabuf_plane_creation() {
-        let plane = DmaBufPlane::new(42, 7680, 0, 0);
-        assert_eq!(plane.fd, 42);
+        let plane = DmaBufPlane::create_test_memfd(7680, 0, 0);
+        assert!(plane.is_valid());
         assert_eq!(plane.stride, 7680);
         assert_eq!(plane.offset, 0);
         assert_eq!(plane.modifier, 0);
+        assert!(plane.raw_fd() >= 0);
+
+        let cloned = plane.try_clone().expect("try_clone failed");
+        assert!(cloned.is_valid());
+        assert_ne!(plane.raw_fd(), cloned.raw_fd());
+    }
+
+    #[test]
+    fn test_raw_frame_zero_copy_check() {
+        let plane = DmaBufPlane::create_test_memfd(7680, 0, 0);
+        let frame = RawFrame {
+            display_id: 0,
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            format: PixelFormat::Bgra8,
+            pts_us: 1000,
+            dma_buf: Some(vec![plane]),
+            data: Bytes::new(),
+        };
+        assert!(frame.is_zero_copy());
+
+        let frame_empty = RawFrame {
+            display_id: 0,
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            format: PixelFormat::Bgra8,
+            pts_us: 1000,
+            dma_buf: Some(vec![]),
+            data: Bytes::new(),
+        };
+        assert!(!frame_empty.is_zero_copy());
     }
 
     #[tokio::test]

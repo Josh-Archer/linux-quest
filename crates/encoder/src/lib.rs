@@ -151,19 +151,20 @@ impl VideoEncoder for MockVideoEncoder {
 
 /// Dynamically discovers and initializes the best hardware encoder (NVIDIA NVENC with fallback).
 pub struct AutoVideoEncoder {
+    _config: EncoderConfig,
     inner: Box<dyn VideoEncoder>,
 }
 
 impl AutoVideoEncoder {
     pub fn new(config: EncoderConfig) -> Self {
-        if NvencEncoder::is_available() {
-            Self {
-                inner: Box::new(NvencEncoder::new(config)),
-            }
+        let inner: Box<dyn VideoEncoder> = if NvencEncoder::is_available() {
+            Box::new(NvencEncoder::new(config.clone()))
         } else {
-            Self {
-                inner: Box::new(MockVideoEncoder::new(config)),
-            }
+            Box::new(MockVideoEncoder::new(config.clone()))
+        };
+        Self {
+            _config: config,
+            inner,
         }
     }
 }
@@ -171,7 +172,18 @@ impl AutoVideoEncoder {
 #[async_trait]
 impl VideoEncoder for AutoVideoEncoder {
     async fn init(&mut self, config: EncoderConfig) -> Result<(), EncoderError> {
-        self.inner.init(config).await
+        match self.inner.init(config.clone()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "Primary video encoder failed to initialize: {e}. Gracefully demoting to MockVideoEncoder"
+                );
+                let mut fallback = MockVideoEncoder::new(config.clone());
+                fallback.init(config).await?;
+                self.inner = Box::new(fallback);
+                Ok(())
+            }
+        }
     }
 
     async fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame, EncoderError> {
