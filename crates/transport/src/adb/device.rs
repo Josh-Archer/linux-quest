@@ -33,7 +33,8 @@ pub struct AdbDevice {
 impl AdbDevice {
     /// Checks whether the device matches a Meta Quest headset.
     /// Matches known Quest codenames ("eureka", "hollywood", "seacliff", "monterey", "pacific")
-    /// and model tokens ("quest", "oculus"). Does not match bare substring "meta".
+    /// and tokenized model components ("quest", "oculus", "quest2", "quest3", "questpro").
+    /// Does not match substrings embedded in words like "request", "conquest", or "questionnaire".
     pub fn is_quest(&self) -> bool {
         let quest_codenames = ["eureka", "hollywood", "seacliff", "monterey", "pacific"];
 
@@ -48,15 +49,29 @@ impl AdbDevice {
             if lower.is_empty() {
                 continue;
             }
-            if lower.contains("quest") || lower.contains("oculus") {
-                return true;
-            }
             for codename in &quest_codenames {
                 if lower == *codename
                     || lower.starts_with(&format!("{codename}_"))
                     || lower.starts_with(&format!("{codename}-"))
                 {
                     return true;
+                }
+            }
+            for token in lower.split(|c: char| !c.is_alphanumeric()) {
+                if let Some(suffix) = token.strip_prefix("quest") {
+                    if suffix.is_empty()
+                        || suffix == "2"
+                        || suffix == "3"
+                        || suffix == "3s"
+                        || suffix == "pro"
+                        || suffix.chars().all(|c| c.is_ascii_digit())
+                    {
+                        return true;
+                    }
+                } else if let Some(suffix) = token.strip_prefix("oculus") {
+                    if suffix.is_empty() || suffix.chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
                 }
             }
         }
@@ -220,5 +235,49 @@ FA1234567890           unauthorized usb:1-2 transport_id:2
             transport_id: Some("11".to_string()),
         };
         assert!(quest.is_quest());
+    }
+
+    #[test]
+    fn test_is_quest_does_not_match_embedded_quest_words() {
+        let test_cases = [
+            "request_device",
+            "conquest_phone",
+            "questionnaire",
+            "unrelated_question",
+        ];
+        for model in &test_cases {
+            let dev = AdbDevice {
+                serial: "DEV123".to_string(),
+                state: AdbDeviceState::Device,
+                product: Some(model.to_string()),
+                model: Some(model.to_string()),
+                device_name: Some(model.to_string()),
+                transport_id: Some("1".to_string()),
+            };
+            assert!(!dev.is_quest(), "Expected {} to NOT match quest", model);
+        }
+
+        let valid_cases = [
+            "Quest_3",
+            "Quest 2",
+            "QuestPro",
+            "Quest-3S",
+            "Meta Quest 3",
+            "Oculus Quest",
+            "eureka",
+            "hollywood",
+            "seacliff",
+        ];
+        for model in &valid_cases {
+            let dev = AdbDevice {
+                serial: "DEV123".to_string(),
+                state: AdbDeviceState::Device,
+                product: Some(model.to_string()),
+                model: Some(model.to_string()),
+                device_name: None,
+                transport_id: Some("1".to_string()),
+            };
+            assert!(dev.is_quest(), "Expected {} to match quest", model);
+        }
     }
 }

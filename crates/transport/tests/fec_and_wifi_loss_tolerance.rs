@@ -39,6 +39,7 @@ fn test_wifi_5_percent_loss_tolerance_with_fec_recovery() {
         max_delay: Duration::from_millis(50),
         jitter_multiplier: 1.5,
         rtt_multiplier: 0.1,
+        ..Default::default()
     });
     let mut reassembler = FrameReassembler::new(16);
     let mut rng = SimpleRng::new(0xDEADBEEF);

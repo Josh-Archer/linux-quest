@@ -53,7 +53,7 @@ impl GaloisField {
 
 static GF: GaloisField = GaloisField::init();
 
-/// Systematic Cauchy Reed-Solomon Erasure Codec for ultra-low latency packet transmission.
+/// Systematic Cauchy Reed-Solomon Erasure Codec over Galois Field GF(2^8).
 pub struct ReedSolomonFec;
 
 #[allow(clippy::needless_range_loop)]

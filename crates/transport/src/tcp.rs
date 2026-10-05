@@ -13,8 +13,8 @@ use crate::{TransportEndpoint, TransportError, TransportMode, TransportStats};
 /// Maximum payload length allowed over TCP transport (16MB).
 pub const MAX_TCP_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
-/// High-throughput, ultra-low-latency TCP streaming endpoint optimized for USB ADB reverse-tethering.
-/// Configured with TCP_NODELAY and tuned socket buffers to sustain 200-250 Mbps with sub-0.5ms jitter.
+/// TCP streaming endpoint for USB ADB reverse-tethering.
+/// Configured with TCP_NODELAY and 4MB socket buffers for low-latency streaming.
 pub struct TcpEndpoint {
     reader: OwnedReadHalf,
     writer: OwnedWriteHalf,
@@ -61,19 +61,36 @@ impl TcpEndpoint {
                 }
 
                 let mut actual_rcv: libc::c_int = 0;
-                let mut len = std::mem::size_of_val(&actual_rcv) as libc::socklen_t;
+                let mut rcv_len = std::mem::size_of_val(&actual_rcv) as libc::socklen_t;
                 if libc::getsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_RCVBUF,
                     &mut actual_rcv as *mut _ as *mut libc::c_void,
-                    &mut len,
+                    &mut rcv_len,
                 ) == 0
                     && actual_rcv < buf_size
                 {
                     tracing::debug!(
                         "Kernel granted SO_RCVBUF of {} bytes (clamped by net.core.rmem_max)",
                         actual_rcv
+                    );
+                }
+
+                let mut actual_snd: libc::c_int = 0;
+                let mut snd_len = std::mem::size_of_val(&actual_snd) as libc::socklen_t;
+                if libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &mut actual_snd as *mut _ as *mut libc::c_void,
+                    &mut snd_len,
+                ) == 0
+                    && actual_snd < buf_size
+                {
+                    tracing::debug!(
+                        "Kernel granted SO_SNDBUF of {} bytes (clamped by net.core.wmem_max)",
+                        actual_snd
                     );
                 }
             }

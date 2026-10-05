@@ -64,6 +64,7 @@ impl SystemAdbRunner {
 
     fn build_cmd(&self, serial: Option<&str>, args: &[&str]) -> Command {
         let mut cmd = Command::new(&self.adb_path);
+        cmd.kill_on_drop(true);
         if let Some(s) = serial {
             cmd.arg("-s").arg(s);
         }

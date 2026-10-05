@@ -94,10 +94,10 @@ mod tests {
 
         let elapsed = start.elapsed();
         // 14000 bytes at 50Mbps = 112,000 bits / 50,000,000 bps = 2.24ms.
-        // Sleep tolerance within 1ms to 50ms.
+        // Assert tighter bounds: at least 1.5ms (>65% of expected) and under 50ms.
         assert!(
-            elapsed.as_millis() >= 1,
-            "Pacing should take at least 1ms, got {:?}",
+            elapsed.as_micros() >= 1500,
+            "Pacing should take at least 1.5ms, got {:?}",
             elapsed
         );
         assert!(elapsed.as_millis() < 50);

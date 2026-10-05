@@ -11,6 +11,8 @@ pub struct JitterBufferConfig {
     pub max_delay: Duration,
     pub jitter_multiplier: f64,
     pub rtt_multiplier: f64,
+    pub max_queue_depth: usize,
+    pub fec_hold_timeout: Duration,
 }
 
 impl Default for JitterBufferConfig {
@@ -20,6 +22,8 @@ impl Default for JitterBufferConfig {
             max_delay: Duration::from_micros(20_000), // 20ms cap to prevent lag accumulation
             jitter_multiplier: 2.0,                  // 2-sigma jitter guard
             rtt_multiplier: 0.1,                     // 10% RTT contribution
+            max_queue_depth: 1024, // Cap queue depth to prevent unbounded memory growth
+            fec_hold_timeout: Duration::from_millis(10), // Wait up to 10ms for FEC parity recovery
         }
     }
 }
@@ -55,6 +59,7 @@ struct FecBlockTracker {
     scheme: FecScheme,
     k: usize,
     m: usize,
+    first_arrival: Instant,
     sources: HashMap<usize, (u32, Packet)>, // index_in_block -> (seq, Packet)
     parities: HashMap<usize, Bytes>,        // parity_index -> raw_bytes
 }
@@ -79,6 +84,9 @@ impl FecBlockTracker {
 
 /// Maximum number of active FEC blocks tracked simultaneously in memory.
 pub const MAX_FEC_BLOCKS: usize = 64;
+
+/// Maximum number of source packets (K) allowed per FEC block in GF(2^8).
+pub const MAX_FEC_K: usize = 256;
 
 /// Dynamic, adaptive jitter buffer with RFC 3550 jitter calculation and integrated FEC recovery.
 pub struct AdaptiveJitterBuffer {
@@ -140,29 +148,7 @@ impl AdaptiveJitterBuffer {
     pub fn ingest_packet(&mut self, packet: Packet, now: Instant) {
         self.stats.packets_received += 1;
 
-        // RFC 3550 Interarrival Jitter Calculation:
-        // D(i, j) = (R_j - S_j) - (R_i - S_i)
-        // J = J + (|D| - J) / 16
-        if let (Some(last_arr), Some(last_ts)) =
-            (self.last_arrival_instant, self.last_sender_timestamp_us)
-        {
-            let elapsed_arr_us = now.duration_since(last_arr).as_micros() as f64;
-            let elapsed_sender_us = (packet.header.timestamp_us as f64) - (last_ts as f64);
-            let d = (elapsed_arr_us - elapsed_sender_us).abs();
-
-            self.jitter_us += (d - self.jitter_us) / 16.0;
-            self.stats.current_jitter_us = self.jitter_us;
-        }
-
-        self.last_arrival_instant = Some(now);
-        self.last_sender_timestamp_us = Some(packet.header.timestamp_us);
-
-        let target_delay = self.current_target_delay();
-        self.stats.current_target_delay_us = target_delay.as_micros() as u64;
-
-        let seq = packet.header.sequence;
-
-        // Handle FEC parity packet
+        // Handle FEC parity packet first without polluting media RFC 3550 jitter calculation
         if packet.header.packet_type == PacketType::FecParity {
             let mut slice = &packet.payload[..];
             if let Ok(fec_header) = FecHeader::decode(&mut slice) {
@@ -181,6 +167,7 @@ impl AdaptiveJitterBuffer {
                         scheme: fec_header.scheme,
                         k: fec_header.source_count as usize,
                         m: fec_header.parity_count as usize,
+                        first_arrival: now,
                         sources: HashMap::new(),
                         parities: HashMap::new(),
                     });
@@ -201,6 +188,33 @@ impl AdaptiveJitterBuffer {
             return;
         }
 
+        // Media packets: RFC 3550 Interarrival Jitter Calculation
+        if let (Some(last_arr), Some(last_ts)) =
+            (self.last_arrival_instant, self.last_sender_timestamp_us)
+        {
+            let elapsed_arr_us = now.duration_since(last_arr).as_micros() as f64;
+            let elapsed_sender_us = (packet.header.timestamp_us as f64) - (last_ts as f64);
+            let d = (elapsed_arr_us - elapsed_sender_us).abs();
+
+            self.jitter_us += (d - self.jitter_us) / 16.0;
+            self.stats.current_jitter_us = self.jitter_us;
+        }
+
+        self.last_arrival_instant = Some(now);
+        self.last_sender_timestamp_us = Some(packet.header.timestamp_us);
+
+        let target_delay = self.current_target_delay();
+        self.stats.current_target_delay_us = target_delay.as_micros() as u64;
+
+        let seq = packet.header.sequence;
+
+        // Discard packets older than expected_sequence immediately
+        if let Some(expected) = self.expected_sequence {
+            if seq < expected {
+                return;
+            }
+        }
+
         // Check if packet belongs to an FEC protected block
         if (packet.header.flags & FLAG_FEC_PROTECTED) != 0 {
             let block_id = packet.header.timestamp_us; // Group by frame/block timestamp
@@ -217,16 +231,25 @@ impl AdaptiveJitterBuffer {
                     scheme: FecScheme::ReedSolomon,
                     k: 0,
                     m: 0,
+                    first_arrival: now,
                     sources: HashMap::new(),
                     parities: HashMap::new(),
                 });
 
             let idx = packet.header.fec_index() as usize;
-            if tracker.k == 0 || idx < tracker.k {
+            let valid_idx = if tracker.k > 0 {
+                idx < tracker.k
+            } else {
+                idx < MAX_FEC_K && tracker.sources.len() < MAX_FEC_K
+            };
+            if valid_idx {
                 tracker.sources.insert(idx, (seq, packet.clone()));
                 self.try_fec_recovery(block_id, now);
             }
         }
+
+        // Enforce maximum queue depth to prevent unbounded memory growth
+        self.evict_stale(self.config.max_queue_depth.saturating_sub(1));
 
         self.queue.insert(
             seq,
@@ -257,6 +280,7 @@ impl AdaptiveJitterBuffer {
                 scheme,
                 k,
                 m,
+                first_arrival: Instant::now(),
                 sources: HashMap::new(),
                 parities: HashMap::new(),
             });
@@ -267,7 +291,7 @@ impl AdaptiveJitterBuffer {
     }
 
     /// Attempts FEC recovery on a block if enough data + parity packets are available.
-    pub fn try_fec_recovery(&mut self, block_id: u64, now: Instant) -> bool {
+    pub fn try_fec_recovery(&mut self, block_id: u64, _now: Instant) -> bool {
         let tracker = match self.fec_blocks.get_mut(&block_id) {
             Some(t) if t.k > 0 => t,
             _ => return false,
@@ -308,6 +332,7 @@ impl AdaptiveJitterBuffer {
         };
 
         if let Ok(all_sources) = recovered {
+            let ref_arrival = tracker.first_arrival;
             let ref_entry = tracker.sources.values().next();
             if let Some((ref_seq, ref_pkt)) = ref_entry {
                 let base_seq = ref_seq.saturating_sub(ref_pkt.header.fec_index() as u32);
@@ -329,7 +354,7 @@ impl AdaptiveJitterBuffer {
                             recovered_packet.header.sequence,
                             QueuedPacket {
                                 packet: recovered_packet.clone(),
-                                arrival_instant: now,
+                                arrival_instant: ref_arrival,
                             },
                         );
                         e.insert((recovered_packet.header.sequence, recovered_packet));
@@ -344,6 +369,34 @@ impl AdaptiveJitterBuffer {
         false
     }
 
+    /// Checks whether a missing sequence number belongs to an active, incomplete FEC block
+    /// that can still be reconstructed (i.e. remaining missing packets <= M).
+    pub fn is_sequence_fec_recoverable(&self, missing_seq: u32) -> bool {
+        for tracker in self.fec_blocks.values() {
+            if tracker.sources.is_empty() {
+                continue;
+            }
+            let (&ref_idx, (ref_seq, _)) = tracker.sources.iter().next().unwrap();
+            let base_seq = ref_seq.saturating_sub(ref_idx as u32);
+            let k = tracker.k;
+            let m = tracker.m;
+            if k > 0 {
+                if missing_seq >= base_seq && missing_seq < base_seq + (k as u32) {
+                    let missing_idx = (missing_seq - base_seq) as usize;
+                    if !tracker.sources.contains_key(&missing_idx) {
+                        let missing_count = k.saturating_sub(tracker.sources.len());
+                        if missing_count > 0 && (m == 0 || missing_count <= m) {
+                            return true;
+                        }
+                    }
+                }
+            } else if missing_seq >= base_seq && missing_seq < base_seq + (MAX_FEC_K as u32) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Pops the next packet ready for playout if its target delay has elapsed.
     pub fn pop_ready_packet(&mut self, now: Instant) -> Option<Packet> {
         let target_delay = self.current_target_delay();
@@ -354,6 +407,18 @@ impl AdaptiveJitterBuffer {
                     // Packet arrived after playout cursor has already advanced past it; discard
                     self.queue.remove(&first_seq);
                     continue;
+                }
+
+                if first_seq > expected {
+                    // Hole detected between expected and first_seq.
+                    // If the missing sequence is part of an incomplete recoverable FEC block,
+                    // hold playout up to fec_hold_timeout for parity recovery.
+                    if self.is_sequence_fec_recoverable(expected) {
+                        let age = now.duration_since(item.arrival_instant);
+                        if age < target_delay + self.config.fec_hold_timeout {
+                            return None;
+                        }
+                    }
                 }
             }
 
@@ -626,5 +691,118 @@ mod tests {
         // Popping must discard late sequence 4 and return None
         assert!(jb.pop_ready_packet(playout).is_none());
         assert_eq!(jb.stats().packets_delivered, 1);
+    }
+
+    #[test]
+    fn test_jitter_buffer_holds_for_fec_recovery() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            fec_hold_timeout: Duration::from_millis(20),
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        let block_id = 5000;
+        let s0 = Bytes::from_static(b"packet-10");
+        let s1 = Bytes::from_static(b"packet-11");
+        let s2 = Bytes::from_static(b"packet-12");
+
+        let sources = vec![s0.clone(), s1.clone(), s2.clone()];
+        let parities = ReedSolomonFec::encode(block_id, &sources, 1).unwrap();
+        jb.register_fec_block(block_id, 3, 1);
+
+        // Sequence 10 and 12 arrive (sequence 11 lost)
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, &s0)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s0,
+        );
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 12, block_id, &s2)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(2),
+            s2,
+        );
+
+        jb.ingest_packet(p0, now);
+        jb.ingest_packet(p2, now);
+
+        // Playout time after min_delay (e.g. 6ms)
+        let playout_1 = now + Duration::from_millis(6);
+        let popped_0 = jb
+            .pop_ready_packet(playout_1)
+            .expect("Sequence 10 should pop");
+        assert_eq!(popped_0.header.sequence, 10);
+
+        // Playout holds for sequence 11 instead of prematurely popping 12 and discarding 11!
+        let hold_check = jb.pop_ready_packet(playout_1);
+        assert!(
+            hold_check.is_none(),
+            "Playout should hold for missing sequence 11 in recoverable block"
+        );
+
+        // Now parity arrives within hold window
+        let parity_pkt = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 20, block_id, &parities[0]),
+            parities[0].clone(),
+        );
+        jb.ingest_packet(parity_pkt, now + Duration::from_millis(8));
+
+        assert_eq!(jb.stats().packets_reconstructed_fec, 1);
+
+        let playout_2 = now + Duration::from_millis(8);
+        let popped_1 = jb
+            .pop_ready_packet(playout_2)
+            .expect("Sequence 11 should pop after recovery");
+        let popped_2 = jb
+            .pop_ready_packet(playout_2)
+            .expect("Sequence 12 should pop next");
+
+        assert_eq!(popped_1.header.sequence, 11);
+        assert_eq!(popped_2.header.sequence, 12);
+        assert_eq!(jb.stats().packets_lost, 0);
+        assert_eq!(jb.stats().packets_delivered, 3);
+    }
+
+    #[test]
+    fn test_jitter_buffer_max_queue_depth_eviction() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            max_queue_depth: 5,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        for seq in 1..=10 {
+            let p = Packet::new(
+                PacketHeader::new(PacketType::VideoFrameChunk, 0, seq, 1000, b"data"),
+                Bytes::from_static(b"data"),
+            );
+            jb.ingest_packet(p, now);
+        }
+
+        assert!(jb.queue_len() <= 5);
+        assert_eq!(jb.stats().packets_lost, 5);
+    }
+
+    #[test]
+    fn test_jitter_buffer_fec_index_cap_when_k_unknown() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+
+        // Packet with out-of-range fec_index (>= MAX_FEC_K = 256)
+        let p_invalid = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, 9999, b"data")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(300),
+            Bytes::from_static(b"data"),
+        );
+        jb.ingest_packet(p_invalid, now);
+
+        // Should not have inserted into block sources
+        if let Some(tracker) = jb.fec_blocks.get(&9999) {
+            assert!(!tracker.sources.contains_key(&300));
+        }
     }
 }
