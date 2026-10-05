@@ -54,20 +54,25 @@ impl FrameLoopEngine {
             11_111 // 90 Hz default
         };
 
-        if context.is_simulated() {
+        let predicted_time = if context.is_simulated() {
             // In simulation mode, pace according to target refresh rate
             let elapsed = self.last_frame_instant.elapsed().as_micros() as u64;
             if elapsed < budget_us {
                 let sleep_duration = Duration::from_micros(budget_us - elapsed);
                 std::thread::sleep(sleep_duration);
             }
-        }
+            self.frame_counter += 1;
+            self.frame_counter as i64 * (budget_us as i64 * 1000)
+        } else {
+            // In live mode, OpenXR FrameWaiter blocks until the display pacing slot
+            let frame_state = context.wait_frame()?;
+            context.begin_frame()?;
+            self.frame_counter += 1;
+            frame_state.predicted_display_time.as_nanos()
+        };
 
         let wait_duration = wait_start.elapsed().as_micros() as u64;
         self.last_frame_instant = Instant::now();
-        self.frame_counter += 1;
-
-        let predicted_time = self.frame_counter as i64 * (budget_us as i64 * 1000);
 
         let metrics = FramePacingMetrics {
             wait_frame_duration_us: wait_duration,

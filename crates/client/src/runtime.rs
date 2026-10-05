@@ -69,24 +69,39 @@ impl QuestClientRuntime {
         // 1. Poll OpenXR events
         self.openxr_context.poll_events()?;
 
+        // If running in live mode, ensure the OpenXR session has transitioned to running
+        if !self.openxr_context.is_simulated() && !self.openxr_context.is_session_running() {
+            return Ok(FramePacingMetrics::default());
+        }
+
         // 2. Pace rendering loop to target headset refresh rate (72Hz, 90Hz, 120Hz)
         let pacing = self.frame_loop.wait_frame_pacing(&self.openxr_context)?;
 
-        // 3. Pop completed video frames whose playout delay has elapsed and queue into decoder
-        let ready_frames = self.receiver.pop_ready_frames(now)?;
+        // 3. Pop completed video frames whose playout delay has elapsed at the current moment
+        let playout_instant = if self.openxr_context.is_simulated() {
+            now
+        } else {
+            Instant::now()
+        };
+
+        let ready_frames = self.receiver.pop_ready_frames(playout_instant)?;
         for frame in ready_frames {
-            self.decoder.queue_input_buffer(
+            if let Err(e) = self.decoder.queue_input_buffer(
                 &frame.bitstream,
                 frame.meta.pts_us,
                 frame.meta.is_keyframe,
-            )?;
+            ) {
+                tracing::warn!(
+                    error = ?e,
+                    frame_id = frame.meta.frame_id,
+                    "Failed to queue video frame into decoder"
+                );
+            }
         }
 
-        // 4. Dequeue hardware-decoded video frame
-        if let Some(frame) = self.decoder.dequeue_output_buffer(0)? {
-            // Zero-copy release direct to OpenXR composition layer surface
-            self.decoder
-                .release_output_buffer(frame.buffer_index, true)?;
+        // 4. Dequeue and release hardware-decoded video frames direct to OpenXR surface
+        while let Some(frame) = self.decoder.dequeue_output_buffer(0)? {
+            let _ = self.decoder.release_output_buffer(frame.buffer_index, true);
         }
 
         // 5. Update debug HUD telemetry
@@ -100,7 +115,12 @@ impl QuestClientRuntime {
             self.receiver.packets_lost_count(),
         );
 
-        // 6. Record render duration
+        // 6. Submit composition layers to OpenXR compositor for timewarp display
+        let display_time = openxr::Time::from_nanos(pacing.predicted_display_time);
+        self.openxr_context
+            .render_and_present_layers(display_time, &self.config)?;
+
+        // 7. Record render duration
         let render_duration = render_start.elapsed().as_micros() as u64;
         self.frame_loop.record_render_duration(render_duration);
 

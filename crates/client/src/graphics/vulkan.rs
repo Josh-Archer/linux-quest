@@ -25,12 +25,14 @@ pub struct VulkanContext {
     graphics_queue: vk::Queue,
     queue_family_index: u32,
     command_pool: vk::CommandPool,
+    owns_device: bool,
+    owns_instance: bool,
     is_simulated: bool,
 }
 
-// Vulkan handles are pointers / integer handles safe to transfer across threads.
+// Vulkan handles can be transferred across thread boundaries (Send).
+// Queue and command pool require external synchronization, so Sync is not implemented.
 unsafe impl Send for VulkanContext {}
-unsafe impl Sync for VulkanContext {}
 
 impl VulkanContext {
     /// Creates a simulated Vulkan context for testing or headless CI environments.
@@ -43,6 +45,8 @@ impl VulkanContext {
             graphics_queue: vk::Queue::null(),
             queue_family_index: 0,
             command_pool: vk::CommandPool::null(),
+            owns_device: false,
+            owns_instance: false,
             is_simulated: true,
         }
     }
@@ -83,6 +87,8 @@ impl VulkanContext {
             graphics_queue,
             queue_family_index,
             command_pool,
+            owns_device: true,
+            owns_instance: true,
             is_simulated: false,
         })
     }
@@ -105,6 +111,29 @@ impl VulkanContext {
     /// Returns the graphics queue handle.
     pub fn graphics_queue(&self) -> vk::Queue {
         self.graphics_queue
+    }
+
+    /// Returns the raw Vulkan instance pointer for OpenXR SessionCreateInfo.
+    pub fn raw_instance_ptr(&self) -> *const std::ffi::c_void {
+        if let Some(instance) = &self.instance {
+            instance.handle().as_raw() as *const _
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    /// Returns the raw Vulkan physical device pointer for OpenXR SessionCreateInfo.
+    pub fn raw_physical_device_ptr(&self) -> *const std::ffi::c_void {
+        self.physical_device.as_raw() as *const _
+    }
+
+    /// Returns the raw Vulkan logical device pointer for OpenXR SessionCreateInfo.
+    pub fn raw_device_ptr(&self) -> *const std::ffi::c_void {
+        if let Some(device) = &self.device {
+            device.handle().as_raw() as *const _
+        } else {
+            std::ptr::null()
+        }
     }
 
     /// Returns a reference to the logical device, if loaded.
@@ -215,11 +244,21 @@ impl VulkanContext {
 impl Drop for VulkanContext {
     fn drop(&mut self) {
         if !self.is_simulated {
-            if let Some(device) = &self.device {
+            if let Some(device) = self.device.take() {
                 unsafe {
                     let _ = device.device_wait_idle();
                     if self.command_pool != vk::CommandPool::null() {
                         device.destroy_command_pool(self.command_pool, None);
+                    }
+                    if self.owns_device {
+                        device.destroy_device(None);
+                    }
+                }
+            }
+            if let Some(instance) = self.instance.take() {
+                unsafe {
+                    if self.owns_instance {
+                        instance.destroy_instance(None);
                     }
                 }
             }

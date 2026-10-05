@@ -20,11 +20,19 @@ pub fn android_main(app: AndroidApp) {
 
     tracing::info!("linux-quest Quest client starting up on Android / Horizon OS");
 
+    // Initialize Android context for OpenXR and MediaCodec
+    unsafe {
+        ndk_context::initialize_android_context(app.vm_as_ptr(), app.activity_as_ptr());
+    }
+
     let config = ClientConfig::default();
     let mut runtime = match QuestClientRuntime::new(config) {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(error = ?e, "Failed to initialize Quest client runtime");
+            unsafe {
+                ndk_context::release_android_context();
+            }
             return;
         }
     };
@@ -65,6 +73,10 @@ pub fn android_main(app: AndroidApp) {
                 tracing::warn!(error = ?e, "Error stepping client frame");
             }
         }
+    }
+
+    unsafe {
+        ndk_context::release_android_context();
     }
 
     tracing::info!("linux-quest client runtime exited cleanly");

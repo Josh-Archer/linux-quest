@@ -118,17 +118,18 @@ echo "[2/6] Packaging APK manifest and resources with aapt..."
 "${AAPT}" package -F "${UNALIGNED_APK}" \
     -M "${SCRIPT_DIR}/AndroidManifest.xml" \
     -I "${ANDROID_JAR}" \
+    -0 so \
     -f
 
-# Step 4: Add native libraries to APK
+# Step 4: Add native libraries to APK (uncompressed for direct page-alignment)
 echo "[3/6] Adding native shared libraries to APK..."
 cd "${OUT_DIR}"
-"${AAPT}" add "${UNALIGNED_APK}" lib/arm64-v8a/liblinux_quest_client.so
+"${AAPT}" add -0 so "${UNALIGNED_APK}" lib/arm64-v8a/liblinux_quest_client.so
 cd "${CLIENT_DIR}"
 
 # Step 5: Align APK with zipalign (4-byte alignment, page-align shared libs)
 echo "[4/6] Aligning APK with zipalign..."
-"${ZIPALIGN}" -f -p 4 "${UNALIGNED_APK}" "${FINAL_APK}"
+"${ZIPALIGN}" -f -p 4 "${UNALIGNED_APK}" "${ALIGNED_APK}"
 
 # Step 6: Create debug keystore if absent and sign APK
 KEYSTORE="${OUT_DIR}/debug.keystore"
@@ -153,7 +154,7 @@ echo "[6/6] Signing APK with apksigner..."
     --ks-pass pass:android \
     --key-pass pass:android \
     --out "${FINAL_APK}" \
-    "${FINAL_APK}"
+    "${ALIGNED_APK}"
 
 "${APKSIGNER}" verify --verbose "${FINAL_APK}" > /dev/null
 

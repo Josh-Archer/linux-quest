@@ -21,17 +21,27 @@ impl RefreshRateManager {
         }
         supported_rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let current_rate = if supported_rates.contains(&initial_rate) {
-            initial_rate
-        } else {
-            supported_rates.first().copied().unwrap_or(90.0)
-        };
+        let current_rate = Self::find_closest(&supported_rates, initial_rate);
 
         Self {
             supported_rates,
             current_rate,
             target_rate: current_rate,
         }
+    }
+
+    fn find_closest(rates: &[f32], requested: f32) -> f32 {
+        rates
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                let diff_a = (a - requested).abs();
+                let diff_b = (b - requested).abs();
+                diff_a
+                    .partial_cmp(&diff_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(90.0)
     }
 
     /// Returns the list of supported refresh rates reported by the headset.

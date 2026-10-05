@@ -97,12 +97,14 @@ pub fn build_cylinder_layer<'a, G: Graphics>(
             },
         });
 
+    // For curved desktop centered on the user, the cylinder axis passes through
+    // the reference space origin, and radius defines the viewing distance.
     let pose = Posef {
         orientation: Quaternionf::IDENTITY,
         position: Vector3f {
             x: 0.0,
             y: 0.0,
-            z: -config.distance,
+            z: 0.0,
         },
     };
 

@@ -48,7 +48,8 @@ fn test_mock_decoder_av1_zero_copy_release() {
     assert_eq!(stats.frames_dropped, 0);
 
     // Queue non-keyframe and release with render=false (simulates frame drop)
-    let av1_inter = vec![0x32, 0x04, 0x00, 0x00, 0x00, 0x01];
+    // AV1 Frame OBU (type 6, size=4, frame_type=1 (INTER_FRAME, bits 7..5 = 001 = 0x20))
+    let av1_inter = vec![0x32, 0x04, 0x20, 0x00, 0x00, 0x01];
     decoder
         .queue_input_buffer(&av1_inter, 111_111, false)
         .unwrap();

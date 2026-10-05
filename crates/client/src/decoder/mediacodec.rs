@@ -1,5 +1,6 @@
 //! Android AMediaCodec zero-copy hardware video decoder implementation.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ pub struct AndroidMediaCodecDecoder {
     video_codec: ClientVideoCodec,
     stats: DecoderStats,
     last_pts_us: u64,
-    last_enqueue_instant: Option<Instant>,
+    enqueue_timestamps: VecDeque<(u64, Instant)>,
     surface_window_ptr: *mut ndk_sys::ANativeWindow,
 }
 
@@ -32,7 +33,7 @@ impl AndroidMediaCodecDecoder {
             video_codec: ClientVideoCodec::Av1,
             stats: DecoderStats::default(),
             last_pts_us: 0,
-            last_enqueue_instant: None,
+            enqueue_timestamps: VecDeque::with_capacity(32),
             surface_window_ptr: std::ptr::null_mut(),
         }
     }
@@ -120,7 +121,7 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
             ndk_sys::AMediaFormat_setInt32(format, c_height_key.as_ptr(), height as i32);
             ndk_sys::AMediaFormat_setInt32(format, c_low_latency_key.as_ptr(), 1);
             ndk_sys::AMediaFormat_setInt32(format, c_priority_key.as_ptr(), 0); // Real-time priority
-            ndk_sys::AMediaFormat_setInt32(format, c_operating_rate_key.as_ptr(), 120);
+            ndk_sys::AMediaFormat_setFloat(format, c_operating_rate_key.as_ptr(), 120.0);
 
             let status = ndk_sys::AMediaCodec_configure(
                 codec_ptr,
@@ -174,8 +175,8 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
             ));
         }
 
-        // Dequeue an available input buffer with a short 5ms (5000us) timeout
-        let input_idx = unsafe { ndk_sys::AMediaCodec_dequeueInputBuffer(self.codec_ptr, 5000) };
+        // Dequeue an available input buffer with a short 1ms (1000us) timeout
+        let input_idx = unsafe { ndk_sys::AMediaCodec_dequeueInputBuffer(self.codec_ptr, 1000) };
 
         if input_idx < 0 {
             self.stats.frames_dropped += 1;
@@ -190,6 +191,10 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
             unsafe { ndk_sys::AMediaCodec_getInputBuffer(self.codec_ptr, idx, &mut out_size) };
 
         if buf_ptr.is_null() || out_size < data.len() {
+            // Return buffer back to codec so it is not permanently leaked
+            unsafe {
+                let _ = ndk_sys::AMediaCodec_queueInputBuffer(self.codec_ptr, idx, 0, 0, 0, 0);
+            }
             return Err(ClientError::Decoder(format!(
                 "AMediaCodec input buffer at index {idx} capacity ({out_size}) too small for packet ({})",
                 data.len()
@@ -212,6 +217,7 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
                 flags,
             );
             if queue_status.0 != 0 {
+                let _ = ndk_sys::AMediaCodec_flush(self.codec_ptr);
                 return Err(ClientError::Decoder(format!(
                     "AMediaCodec_queueInputBuffer failed: {queue_status:?}"
                 )));
@@ -220,7 +226,10 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
 
         self.stats.frames_queued += 1;
         self.last_pts_us = pts_us;
-        self.last_enqueue_instant = Some(Instant::now());
+        if self.enqueue_timestamps.len() >= 64 {
+            self.enqueue_timestamps.pop_front();
+        }
+        self.enqueue_timestamps.push_back((pts_us, Instant::now()));
         Ok(())
     }
 
@@ -251,14 +260,24 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
             let pts_us = buffer_info.presentationTimeUs as u64;
             let is_keyframe = (buffer_info.flags & 1) != 0;
 
-            if let Some(enqueue_time) = self.last_enqueue_instant {
-                let latency = enqueue_time.elapsed().as_micros() as u64;
-                self.stats.last_latency_us = latency;
-                if self.stats.frames_decoded == 0 {
-                    self.stats.avg_latency_us = latency;
-                } else {
-                    self.stats.avg_latency_us = (self.stats.avg_latency_us * 7 + latency) / 8;
-                }
+            // Compute pipelined decode latency by matching pts_us
+            let latency = if let Some(pos) = self
+                .enqueue_timestamps
+                .iter()
+                .position(|(pts, _)| *pts == pts_us)
+            {
+                let (_, enqueue_time) = self.enqueue_timestamps.remove(pos).unwrap();
+                enqueue_time.elapsed().as_micros() as u64
+            } else if let Some((_, enqueue_time)) = self.enqueue_timestamps.pop_front() {
+                enqueue_time.elapsed().as_micros() as u64
+            } else {
+                1500
+            };
+            self.stats.last_latency_us = latency;
+            if self.stats.frames_decoded == 0 {
+                self.stats.avg_latency_us = latency;
+            } else {
+                self.stats.avg_latency_us = (self.stats.avg_latency_us * 7 + latency) / 8;
             }
 
             self.stats.frames_decoded += 1;
@@ -308,17 +327,29 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
             ));
         }
 
+        // Only render to surface if an ANativeWindow was actually attached
+        let should_render = render && !self.surface_window_ptr.is_null();
         let status = unsafe {
-            ndk_sys::AMediaCodec_releaseOutputBuffer(self.codec_ptr, buffer_index, render)
+            ndk_sys::AMediaCodec_releaseOutputBuffer(self.codec_ptr, buffer_index, should_render)
         };
 
         if status.0 != 0 {
+            // Attempt emergency release without rendering to avoid permanently leaking the output buffer slot
+            if should_render {
+                unsafe {
+                    let _ = ndk_sys::AMediaCodec_releaseOutputBuffer(
+                        self.codec_ptr,
+                        buffer_index,
+                        false,
+                    );
+                }
+            }
             return Err(ClientError::Decoder(format!(
                 "AMediaCodec_releaseOutputBuffer failed with status {status:?}"
             )));
         }
 
-        if render {
+        if should_render {
             self.stats.frames_rendered += 1;
         } else {
             self.stats.frames_dropped += 1;

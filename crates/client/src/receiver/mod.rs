@@ -22,9 +22,10 @@ pub struct ClientReceiver {
 impl ClientReceiver {
     /// Creates a new client receiver configured with jitter buffer parameters.
     pub fn new(config: &ClientConfig) -> Self {
+        let initial_depth = config.jitter_buffer_initial_depth_ms;
         let jb_config = JitterBufferConfig {
-            min_delay: Duration::from_millis(config.jitter_buffer_initial_depth_ms.min(2)),
-            max_delay: Duration::from_millis(config.jitter_buffer_initial_depth_ms.max(20)),
+            min_delay: Duration::from_millis(initial_depth),
+            max_delay: Duration::from_millis((initial_depth * 4).max(30)),
             max_queue_depth: config.jitter_buffer_max_depth,
             ..Default::default()
         };
@@ -47,9 +48,23 @@ impl ClientReceiver {
         let mut completed_frames = Vec::new();
 
         while let Some(ready_pkt) = self.jitter_buffer.pop_ready_packet(now) {
-            if let Ok(chunk) = VideoChunk::deserialize(&ready_pkt.payload) {
-                if let Some(frame) = self.reassembler.ingest_chunk(chunk)? {
-                    completed_frames.push(frame);
+            // Only process video frame chunks through the frame reassembler
+            if ready_pkt.header.packet_type
+                == linux_quest_protocol::packet::PacketType::VideoFrameChunk
+            {
+                match VideoChunk::deserialize(&ready_pkt.payload) {
+                    Ok(chunk) => {
+                        if let Some(frame) = self.reassembler.ingest_chunk(chunk)? {
+                            completed_frames.push(frame);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            seq = ready_pkt.header.sequence,
+                            "Failed to deserialize video chunk payload"
+                        );
+                    }
                 }
             }
         }
