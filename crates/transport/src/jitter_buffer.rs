@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use linux_quest_protocol::{Packet, PacketHeader, PacketType, FLAG_FEC_PROTECTED};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::fec::{reed_solomon::ReedSolomonFec, xor::XorFec, FecHeader, FecScheme};
@@ -105,6 +105,7 @@ pub struct AdaptiveJitterBuffer {
     highest_seen_unwrapped: Option<u64>,
     expected_unwrapped: Option<u64>,
     fec_hold_anchor: Option<(u64, Instant)>,
+    received_parity_sequences: BTreeSet<u64>,
 
     queue: BTreeMap<u64, QueuedPacket>,
     fec_blocks: HashMap<u64, FecBlockTracker>,
@@ -123,6 +124,7 @@ impl AdaptiveJitterBuffer {
             highest_seen_unwrapped: None,
             expected_unwrapped: None,
             fec_hold_anchor: None,
+            received_parity_sequences: BTreeSet::new(),
             queue: BTreeMap::new(),
             fec_blocks: HashMap::new(),
             stats: JitterBufferStats::default(),
@@ -164,13 +166,13 @@ impl AdaptiveJitterBuffer {
         &self.stats
     }
 
-    /// Update smoothed RTT estimate via Exponentially Weighted Moving Average (EWMA, alpha = 0.875).
+    /// Update smoothed RTT estimate via Exponentially Weighted Moving Average (EWMA, alpha = 0.125).
     pub fn update_rtt(&mut self, rtt_sample: Duration) {
         let sample_us = rtt_sample.as_micros() as f64;
         if self.smoothed_rtt_us == 0.0 {
             self.smoothed_rtt_us = sample_us;
         } else {
-            // EWMA with alpha = 0.875 (RFC 6298 / Jacobson's algorithm)
+            // EWMA with alpha = 0.125 / Jacobson's algorithm (RFC 6298: (1 - alpha) * SRTT + alpha * sample)
             self.smoothed_rtt_us = 0.875 * self.smoothed_rtt_us + 0.125 * sample_us;
         }
         self.stats.smoothed_rtt_us = self.smoothed_rtt_us;
@@ -192,6 +194,17 @@ impl AdaptiveJitterBuffer {
 
         // Handle FEC parity packet first without polluting media RFC 3550 jitter calculation
         if packet.header.packet_type == PacketType::FecParity {
+            let seq = packet.header.sequence;
+            let unwrapped_seq = self.unwrap_sequence(seq);
+            self.received_parity_sequences.insert(unwrapped_seq);
+            if self.received_parity_sequences.len() > 2048 {
+                if let Some(expected) = self.expected_unwrapped {
+                    self.received_parity_sequences.retain(|&s| s >= expected);
+                } else if let Some(&oldest) = self.received_parity_sequences.iter().next() {
+                    self.received_parity_sequences.remove(&oldest);
+                }
+            }
+
             let mut slice = &packet.payload[..];
             if let Ok(fec_header) = FecHeader::decode(&mut slice) {
                 if !self.fec_blocks.contains_key(&fec_header.block_id)
@@ -339,8 +352,18 @@ impl AdaptiveJitterBuffer {
         );
 
         // Enforce maximum queue depth to prevent unbounded memory growth.
-        // Eviction runs strictly AFTER insertion so that a newly arrived in-order
-        // packet filling a hole is never skipped or pre-emptively evicted by cursor advancement.
+        // If the newly arrived packet filled a hole in the past (unwrapped_seq < max_seq in queue),
+        // it must not be evicted from the front (which would discard the in-order/hole-fill packet
+        // and falsely increment packets_lost). Instead, drop excess future packets from the tail.
+        if let Some(&max_seq) = self.queue.keys().next_back() {
+            if unwrapped_seq < max_seq {
+                while self.queue.len() > self.config.max_queue_depth {
+                    self.queue.pop_last();
+                }
+                return;
+            }
+        }
+
         self.evict_stale(self.config.max_queue_depth);
     }
 
@@ -475,8 +498,11 @@ impl AdaptiveJitterBuffer {
                     }
                 }
                 self.fec_blocks.remove(&block_id);
-                // Cap queue depth after inserting recovered packets
-                self.evict_stale(self.config.max_queue_depth);
+                // Cap queue depth after inserting recovered packets (dropping excess from tail
+                // to preserve the newly reconstructed media packets at the playout cursor)
+                while self.queue.len() > self.config.max_queue_depth {
+                    self.queue.pop_last();
+                }
                 return true;
             }
         }
@@ -552,16 +578,56 @@ impl AdaptiveJitterBuffer {
         false
     }
 
+    /// Checks whether an unwrapped sequence number corresponds to a parity packet
+    /// (either received as FecParity, or within the parity range of a known FEC block).
+    fn is_unwrapped_sequence_parity(&self, seq: u64) -> bool {
+        if self.received_parity_sequences.contains(&seq) {
+            return true;
+        }
+
+        for tracker in self.fec_blocks.values() {
+            if let Some(base) = tracker.unwrapped_base_seq {
+                if tracker.k > 0 && tracker.m > 0 {
+                    let parity_start = base + tracker.k as u64;
+                    let parity_end = parity_start + tracker.m as u64;
+                    if seq >= parity_start && seq < parity_end {
+                        return true;
+                    }
+                }
+            } else if let Some(base_wire) = tracker.base_sequence {
+                if tracker.k > 0 && tracker.m > 0 {
+                    let seq_wire = seq as u32;
+                    let offset = seq_wire.wrapping_sub(base_wire);
+                    let k = tracker.k as u32;
+                    let m = tracker.m as u32;
+                    if offset >= k && offset < k.saturating_add(m) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     /// Pops the next packet ready for playout if its target delay has elapsed.
     pub fn pop_ready_packet(&mut self, now: Instant) -> Option<Packet> {
         let target_delay = self.current_target_delay();
 
         while let Some((&first_unwrapped_seq, item)) = self.queue.iter().next() {
-            if let Some(expected) = self.expected_unwrapped {
+            if let Some(mut expected) = self.expected_unwrapped {
                 if first_unwrapped_seq < expected {
                     // Packet arrived after playout cursor has already advanced past it; discard
                     self.queue.remove(&first_unwrapped_seq);
                     continue;
+                }
+
+                // Advance expected cursor past any leading parity sequences between expected and first_unwrapped_seq
+                while expected < first_unwrapped_seq && self.is_unwrapped_sequence_parity(expected)
+                {
+                    self.received_parity_sequences.remove(&expected);
+                    expected += 1;
+                    self.expected_unwrapped = Some(expected);
                 }
 
                 if first_unwrapped_seq > expected {
@@ -596,8 +662,18 @@ impl AdaptiveJitterBuffer {
                 let item = self.queue.remove(&first_unwrapped_seq)?;
                 if let Some(expected) = self.expected_unwrapped {
                     if first_unwrapped_seq > expected {
-                        let diff = first_unwrapped_seq - expected;
-                        self.stats.packets_lost += diff;
+                        let mut lost_media = 0;
+                        let gap_limit = first_unwrapped_seq.min(expected + 1024);
+                        for seq in expected..gap_limit {
+                            if !self.is_unwrapped_sequence_parity(seq) {
+                                lost_media += 1;
+                            }
+                            self.received_parity_sequences.remove(&seq);
+                        }
+                        if first_unwrapped_seq > gap_limit {
+                            lost_media += first_unwrapped_seq - gap_limit;
+                        }
+                        self.stats.packets_lost += lost_media;
                     }
                 }
                 self.fec_hold_anchor = None;
@@ -617,10 +693,29 @@ impl AdaptiveJitterBuffer {
         while self.queue.len() > max_depth {
             if let Some((&first_unwrapped_seq, _)) = self.queue.iter().next() {
                 self.queue.remove(&first_unwrapped_seq);
-                if let Some(expected) = self.expected_unwrapped {
+                if let Some(mut expected) = self.expected_unwrapped {
+                    // Skip any leading parity sequences
+                    while expected < first_unwrapped_seq
+                        && self.is_unwrapped_sequence_parity(expected)
+                    {
+                        self.received_parity_sequences.remove(&expected);
+                        expected += 1;
+                    }
+
                     if first_unwrapped_seq >= expected {
-                        let diff = first_unwrapped_seq - expected;
-                        self.stats.packets_lost += diff + 1;
+                        let mut lost = 0;
+                        let gap_limit = first_unwrapped_seq.min(expected + 1024);
+                        for seq in expected..gap_limit {
+                            if !self.is_unwrapped_sequence_parity(seq) {
+                                lost += 1;
+                            }
+                            self.received_parity_sequences.remove(&seq);
+                        }
+                        if first_unwrapped_seq > gap_limit {
+                            lost += first_unwrapped_seq - gap_limit;
+                        }
+                        lost += 1;
+                        self.stats.packets_lost += lost;
                         self.expected_unwrapped = Some(first_unwrapped_seq + 1);
                     }
                 } else {
@@ -1519,8 +1614,13 @@ mod tests {
         );
         jb.ingest_packet(p11, now);
 
-        // In the previous buggy code, 12 was pre-evicted and cursor became 13, so both 11 and 12 were deleted.
-        // With eviction after insert, packet 12 is preserved and delivered!
+        // When packet 11 arrives, it is the in-order fill at expected cursor 11.
+        // With tail eviction of premature future packets (14 dropped), packets 11, 12, 13 are all preserved and delivered!
+        let out11 = jb
+            .pop_ready_packet(now)
+            .expect("Packet 11 (in-order fill) must be ready to play");
+        assert_eq!(out11.header.sequence, 11);
+
         let out12 = jb
             .pop_ready_packet(now)
             .expect("Packet 12 must be ready to play");
@@ -1530,11 +1630,101 @@ mod tests {
             .pop_ready_packet(now)
             .expect("Packet 13 must be ready to play");
         assert_eq!(out13.header.sequence, 13);
+        assert_eq!(
+            jb.stats().packets_lost,
+            0,
+            "In-order packet 11 must not increment packets_lost"
+        );
+    }
 
-        let out14 = jb
-            .pop_ready_packet(now)
-            .expect("Packet 14 must be ready to play");
-        assert_eq!(out14.header.sequence, 14);
+    #[test]
+    fn test_jitter_buffer_lossless_fec_parity_sequence_does_not_inflate_loss() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Block 1 (Frame 1):
+        // Source 0 (seq 1), Source 1 (seq 2), Parity 0 (seq 3)
+        let block1 = 1001;
+        let s0 = Bytes::from_static(b"f1-s0");
+        let s1 = Bytes::from_static(b"f1-s1");
+        let parities1 = ReedSolomonFec::encode(block1, &[s0.clone(), s1.clone()], 1).unwrap();
+        jb.register_fec_block(block1, 2, 1);
+
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, block1, &s0)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s0,
+        );
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 2, block1, &s1)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            s1,
+        );
+        let p3_parity = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 3, block1, &parities1[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities1[0].clone(),
+        );
+
+        // Block 2 (Frame 2):
+        // Source 0 (seq 4), Source 1 (seq 5), Parity 0 (seq 6)
+        let block2 = 1002;
+        let s2 = Bytes::from_static(b"f2-s0");
+        let s3 = Bytes::from_static(b"f2-s1");
+        let parities2 = ReedSolomonFec::encode(block2, &[s2.clone(), s3.clone()], 1).unwrap();
+        jb.register_fec_block(block2, 2, 1);
+
+        let p4 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 4, block2, &s2)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s2,
+        );
+        let p5 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 5, block2, &s3)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            s3,
+        );
+        let p6_parity = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 6, block2, &parities2[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities2[0].clone(),
+        );
+
+        // Ingest Block 1 and Block 2 losslessly
+        jb.ingest_packet(p1, now);
+        jb.ingest_packet(p2, now);
+        jb.ingest_packet(p3_parity, now);
+        jb.ingest_packet(p4, now);
+        jb.ingest_packet(p5, now);
+        jb.ingest_packet(p6_parity, now);
+
+        // Pop all 4 media packets
+        let out1 = jb.pop_ready_packet(now).expect("Packet 1 must pop");
+        let out2 = jb.pop_ready_packet(now).expect("Packet 2 must pop");
+        let out4 = jb.pop_ready_packet(now).expect("Packet 4 must pop");
+        let out5 = jb.pop_ready_packet(now).expect("Packet 5 must pop");
+
+        assert_eq!(out1.header.sequence, 1);
+        assert_eq!(out2.header.sequence, 2);
+        assert_eq!(out4.header.sequence, 4);
+        assert_eq!(out5.header.sequence, 5);
+
+        // Verification: Lossless transmission must report 0 packets lost and 0.0 loss rate!
+        assert_eq!(
+            jb.stats().packets_lost,
+            0,
+            "Parity sequences must not be counted as lost media"
+        );
+        assert_eq!(jb.stats().packets_delivered, 4);
+        assert_eq!(jb.stats().loss_rate(), 0.0);
     }
 
     #[test]

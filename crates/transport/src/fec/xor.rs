@@ -73,10 +73,11 @@ impl XorFec {
             return Ok(result);
         }
 
-        if received_sources.len() < k - 1 || parity_packet.is_none() {
+        let valid_sources = (0..k).filter(|i| received_sources.contains_key(i)).count();
+        if valid_sources < k - 1 || parity_packet.is_none() {
             return Err(FecError::InsufficientPackets {
                 needed: k,
-                received: received_sources.len() + if parity_packet.is_some() { 1 } else { 0 },
+                received: valid_sources + if parity_packet.is_some() { 1 } else { 0 },
             });
         }
 
@@ -102,7 +103,7 @@ impl XorFec {
         let missing_idx = (0..k).find(|i| !received_sources.contains_key(i)).ok_or(
             FecError::InsufficientPackets {
                 needed: k,
-                received: received_sources.len(),
+                received: valid_sources,
             },
         )?;
 
