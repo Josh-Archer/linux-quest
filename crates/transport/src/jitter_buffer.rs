@@ -219,9 +219,9 @@ impl AdaptiveJitterBuffer {
 
         let seq = packet.header.sequence;
 
-        // Discard packets older than expected_sequence immediately
+        // Discard packets older than expected_sequence immediately (wrap-aware RFC 1982 comparison)
         if let Some(expected) = self.expected_sequence {
-            if seq < expected {
+            if (seq.wrapping_sub(expected) as i32) < 0 {
                 return;
             }
         }
@@ -302,6 +302,11 @@ impl AdaptiveJitterBuffer {
     ) {
         if k == 0 || m == 0 || k + m > MAX_FEC_K {
             return;
+        }
+        if !self.fec_blocks.contains_key(&block_id) && self.fec_blocks.len() >= MAX_FEC_BLOCKS {
+            if let Some(&oldest) = self.fec_blocks.keys().min() {
+                self.fec_blocks.remove(&oldest);
+            }
         }
         let tracker = self
             .fec_blocks
@@ -448,13 +453,14 @@ impl AdaptiveJitterBuffer {
 
         while let Some((&first_seq, item)) = self.queue.iter().next() {
             if let Some(expected) = self.expected_sequence {
-                if first_seq < expected {
+                let diff = first_seq.wrapping_sub(expected) as i32;
+                if diff < 0 {
                     // Packet arrived after playout cursor has already advanced past it; discard
                     self.queue.remove(&first_seq);
                     continue;
                 }
 
-                if first_seq > expected {
+                if diff > 0 {
                     // Hole detected between expected and first_seq.
                     // If the missing sequence is part of an incomplete recoverable FEC block,
                     // hold playout up to fec_hold_timeout for parity recovery.
@@ -471,11 +477,12 @@ impl AdaptiveJitterBuffer {
             if age >= target_delay {
                 let item = self.queue.remove(&first_seq)?;
                 if let Some(expected) = self.expected_sequence {
-                    if first_seq > expected {
-                        self.stats.packets_lost += (first_seq - expected) as u64;
+                    let diff = first_seq.wrapping_sub(expected) as i32;
+                    if diff > 0 {
+                        self.stats.packets_lost += diff as u64;
                     }
                 }
-                self.expected_sequence = Some(first_seq + 1);
+                self.expected_sequence = Some(first_seq.wrapping_add(1));
                 self.stats.packets_delivered += 1;
                 return Some(item.packet);
             } else {
@@ -492,9 +499,10 @@ impl AdaptiveJitterBuffer {
             if let Some((&first_seq, _)) = self.queue.iter().next() {
                 self.queue.remove(&first_seq);
                 if let Some(expected) = self.expected_sequence {
-                    if first_seq >= expected {
-                        self.stats.packets_lost += (first_seq - expected) as u64 + 1;
-                        self.expected_sequence = Some(first_seq.saturating_add(1));
+                    let diff = first_seq.wrapping_sub(expected) as i32;
+                    if diff >= 0 {
+                        self.stats.packets_lost += (diff as u64) + 1;
+                        self.expected_sequence = Some(first_seq.wrapping_add(1));
                     }
                 } else {
                     self.stats.packets_lost += 1;
@@ -1107,5 +1115,95 @@ mod tests {
         // Must not panic with debug overflow arithmetic!
         assert!(jb.is_sequence_fec_recoverable(u32::MAX - 1));
         assert!(!jb.is_sequence_fec_recoverable(10));
+    }
+
+    #[test]
+    fn test_jitter_buffer_sequence_wrap_across_u32_max() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Ingest packet u32::MAX
+        let p_max = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, u32::MAX, 100, b"max"),
+            Bytes::from_static(b"max"),
+        );
+        jb.ingest_packet(p_max, now);
+
+        // Pop packet u32::MAX -> cursor must wrap to 0 without debug panic
+        let popped = jb.pop_ready_packet(now).expect("u32::MAX should pop");
+        assert_eq!(popped.header.sequence, u32::MAX);
+        assert_eq!(jb.expected_sequence, Some(0));
+
+        // Ingest packet 0 (post-wrap)
+        let p_zero = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 0, 101, b"zero"),
+            Bytes::from_static(b"zero"),
+        );
+        jb.ingest_packet(p_zero, now);
+
+        // Packet 0 must not be discarded as old
+        let popped_zero = jb.pop_ready_packet(now).expect("Packet 0 should pop");
+        assert_eq!(popped_zero.header.sequence, 0);
+        assert_eq!(jb.expected_sequence, Some(1));
+    }
+
+    #[test]
+    fn test_jitter_buffer_evict_stale_wraps_cursor_at_u32_max() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            max_queue_depth: 1,
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, u32::MAX, 100, b"max"),
+            Bytes::from_static(b"max"),
+        );
+        jb.ingest_packet(p1, now);
+        // Pop to set expected_sequence = Some(u32::MAX)
+        let _ = jb.pop_ready_packet(now);
+        assert_eq!(jb.expected_sequence, Some(0));
+
+        // Now test eviction when first_seq is u32::MAX and expected is u32::MAX
+        let mut jb2 = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            max_queue_depth: 1,
+            ..Default::default()
+        });
+        jb2.expected_sequence = Some(u32::MAX);
+        let p_max = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, u32::MAX, 100, b"max"),
+            Bytes::from_static(b"max"),
+        );
+        let p_zero = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 0, 101, b"zero"),
+            Bytes::from_static(b"zero"),
+        );
+        jb2.ingest_packet(p_max, now);
+        jb2.ingest_packet(p_zero, now);
+
+        // Eviction should have run, advancing expected_sequence to Some(0) instead of saturating
+        assert_eq!(jb2.expected_sequence, Some(0));
+    }
+
+    #[test]
+    fn test_jitter_buffer_register_fec_block_caps_max_fec_blocks() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+
+        for i in 1..=100 {
+            jb.register_fec_block(i, 4, 1);
+        }
+
+        assert!(
+            jb.fec_blocks.len() <= MAX_FEC_BLOCKS,
+            "fec_blocks count {} should not exceed MAX_FEC_BLOCKS {}",
+            jb.fec_blocks.len(),
+            MAX_FEC_BLOCKS
+        );
     }
 }
