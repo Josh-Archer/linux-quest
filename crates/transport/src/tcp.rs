@@ -32,20 +32,50 @@ impl TcpEndpoint {
             let fd = stream.as_raw_fd();
             let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB socket buffers
             unsafe {
-                libc::setsockopt(
+                let rcv_res = libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_RCVBUF,
                     &buf_size as *const _ as *const libc::c_void,
                     std::mem::size_of_val(&buf_size) as libc::socklen_t,
                 );
-                libc::setsockopt(
+                if rcv_res != 0 {
+                    tracing::warn!(
+                        "Failed to setsockopt SO_RCVBUF: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+
+                let snd_res = libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
                     &buf_size as *const _ as *const libc::c_void,
                     std::mem::size_of_val(&buf_size) as libc::socklen_t,
                 );
+                if snd_res != 0 {
+                    tracing::warn!(
+                        "Failed to setsockopt SO_SNDBUF: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+
+                let mut actual_rcv: libc::c_int = 0;
+                let mut len = std::mem::size_of_val(&actual_rcv) as libc::socklen_t;
+                if libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &mut actual_rcv as *mut _ as *mut libc::c_void,
+                    &mut len,
+                ) == 0
+                    && actual_rcv < buf_size
+                {
+                    tracing::debug!(
+                        "Kernel granted SO_RCVBUF of {} bytes (clamped by net.core.rmem_max)",
+                        actual_rcv
+                    );
+                }
             }
         }
 

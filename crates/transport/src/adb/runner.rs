@@ -203,6 +203,10 @@ impl MockAdbRunner {
         self.state.lock().fail_next = error_msg;
     }
 
+    pub fn clear_rules(&self, serial: &str) {
+        self.state.lock().reverse_rules.remove(serial);
+    }
+
     pub fn get_rules(&self, serial: &str) -> Vec<AdbReverseRule> {
         self.state
             .lock()

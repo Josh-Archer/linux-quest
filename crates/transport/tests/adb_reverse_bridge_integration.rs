@@ -109,15 +109,14 @@ async fn test_tcp_endpoint_high_throughput_and_sub_millisecond_jitter() {
     let payload = Bytes::from(vec![0x5A; chunk_size]);
     let packet_count = 1000;
 
+    let base_instant = Instant::now();
+
     let sender_task = tokio::spawn(async move {
         for seq in 1..=packet_count {
-            let header = PacketHeader::new(
-                PacketType::VideoFrameChunk,
-                0,
-                seq,
-                seq as u64 * 1000,
-                &payload,
-            );
+            let send_time = Instant::now();
+            let timestamp_us = send_time.duration_since(base_instant).as_micros() as u64;
+            let header =
+                PacketHeader::new(PacketType::VideoFrameChunk, 0, seq, timestamp_us, &payload);
             client_ep
                 .send_packet(Packet::new(header, payload.clone()))
                 .await
@@ -126,47 +125,57 @@ async fn test_tcp_endpoint_high_throughput_and_sub_millisecond_jitter() {
         client_ep
     });
 
-    let mut latencies_us = Vec::with_capacity(packet_count as usize);
-    let mut prev_arrival = Instant::now();
+    let mut rfc3550_jitter_us = 0.0f64;
+    let mut prev_transit: Option<f64> = None;
+    let stream_start = Instant::now();
 
     for seq in 1..=packet_count {
         let packet = server_ep.recv_packet().await.unwrap();
-        let arrival = Instant::now();
+        let arrival_time = Instant::now();
+        let arrival_us = arrival_time.duration_since(base_instant).as_micros() as f64;
+        let send_us = packet.header.timestamp_us as f64;
+        let transit_us = arrival_us - send_us;
 
         assert_eq!(packet.header.sequence, seq);
         assert_eq!(packet.payload.len(), chunk_size);
 
-        if seq > 1 {
-            let inter_arrival = arrival.duration_since(prev_arrival).as_micros() as f64;
-            latencies_us.push(inter_arrival);
+        if let Some(prev) = prev_transit {
+            // RFC 3550 Interarrival Jitter Calculation:
+            // D(i, j) = (R_j - S_j) - (R_i - S_i) = transit_j - transit_i
+            // J = J + (|D| - J) / 16.0
+            let d = (transit_us - prev).abs();
+            rfc3550_jitter_us += (d - rfc3550_jitter_us) / 16.0;
         }
-        prev_arrival = arrival;
+        prev_transit = Some(transit_us);
     }
 
+    let elapsed = stream_start.elapsed();
     let _client_ep = sender_task.await.unwrap();
 
+    let total_bytes = (packet_count as u64) * (32 + chunk_size as u64);
     assert_eq!(
         server_ep.stats().packets_recv.load(Ordering::Relaxed),
         packet_count as u64
     );
     assert_eq!(
         server_ep.stats().bytes_recv.load(Ordering::Relaxed),
-        (packet_count as u64) * (32 + chunk_size as u64)
+        total_bytes
     );
 
-    // Compute RFC 3550 inter-arrival transit jitter over TCP endpoint stream
-    if latencies_us.len() > 1 {
-        let mut jitter_us = 0.0f64;
-        for i in 1..latencies_us.len() {
-            let d = (latencies_us[i] - latencies_us[i - 1]).abs();
-            jitter_us += (d - jitter_us) / 16.0;
-        }
+    // Compute measured throughput in Mbps
+    let throughput_mbps = (total_bytes as f64 * 8.0) / (elapsed.as_secs_f64() * 1_000_000.0);
 
-        // Verify sub-0.5ms (500us) transport jitter requirement
-        assert!(
-            jitter_us < 500.0,
-            "TCP inter-arrival jitter {}us exceeds 500us sub-millisecond target",
-            jitter_us
-        );
-    }
+    // Verify high throughput sustained (> 200 Mbps)
+    assert!(
+        throughput_mbps > 200.0,
+        "Measured throughput {:.2} Mbps below 200 Mbps target",
+        throughput_mbps
+    );
+
+    // Verify sub-0.5ms (500us) RFC 3550 transport transit jitter
+    assert!(
+        rfc3550_jitter_us < 500.0,
+        "RFC 3550 transit jitter {:.2}us exceeds 500us sub-millisecond target",
+        rfc3550_jitter_us
+    );
 }

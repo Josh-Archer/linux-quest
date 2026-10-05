@@ -14,6 +14,9 @@ impl XorFec {
         }
 
         let max_len = source_packets.iter().map(|p| p.len()).max().unwrap_or(0);
+        if max_len + 2 > u16::MAX as usize {
+            return Err(FecError::InvalidConfiguration { k, m: 1 });
+        }
         let symbol_size = max_len + 2;
 
         let mut parity_symbol = vec![0u8; symbol_size];
@@ -51,6 +54,10 @@ impl XorFec {
         mut received_sources: HashMap<usize, Bytes>,
         parity_packet: Option<&Bytes>,
     ) -> Result<Vec<Bytes>, FecError> {
+        if k == 0 || k > u16::MAX as usize {
+            return Err(FecError::InvalidConfiguration { k, m: 1 });
+        }
+
         if received_sources.len() == k {
             let mut result = Vec::with_capacity(k);
             for i in 0..k {
@@ -204,5 +211,22 @@ mod tests {
 
         let result = XorFec::decode(10, 3, received, Some(&parity));
         assert!(matches!(result, Err(FecError::InsufficientPackets { .. })));
+    }
+
+    #[test]
+    fn test_xor_fec_decode_zero_k() {
+        let received = HashMap::new();
+        let result = XorFec::decode(1, 0, received, None);
+        assert!(matches!(
+            result,
+            Err(FecError::InvalidConfiguration { k: 0, m: 1 })
+        ));
+    }
+
+    #[test]
+    fn test_xor_fec_oversized_payload() {
+        let huge_packet = Bytes::from(vec![0u8; 65534]);
+        let result = XorFec::encode(1, &[huge_packet]);
+        assert!(matches!(result, Err(FecError::InvalidConfiguration { .. })));
     }
 }

@@ -92,6 +92,9 @@ impl ReedSolomonFec {
         }
 
         let max_len = source_packets.iter().map(|p| p.len()).max().unwrap_or(0);
+        if max_len + 2 > u16::MAX as usize {
+            return Err(FecError::InvalidConfiguration { k, m });
+        }
         let symbol_size = max_len + 2;
 
         // Prepare source symbols: [len: u16][payload...][zero pad]

@@ -171,14 +171,24 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
 
                 if !rule_active {
                     // Re-apply reverse rule if dropped
-                    let _ = self
+                    if let Err(e) = self
                         .runner
                         .reverse(
                             Some(serial),
                             self.config.remote_port,
                             self.config.local_port,
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!("Failed to re-apply reverse port forwarding rule: {e}");
+                        self.state = AdbBridgeState::Reconnecting {
+                            serial: serial.clone(),
+                            attempts: 1,
+                        };
+                        let evt = AdbBridgeEvent::Error(e.to_string());
+                        let _ = self.event_sender.send(evt.clone());
+                        return Ok(Some(evt));
+                    }
                 }
 
                 Ok(None)
@@ -371,5 +381,49 @@ mod tests {
             }
         );
         assert!(matches!(bridge.state(), AdbBridgeState::Connected { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_adb_bridge_reverse_reapply_failure() {
+        let runner = MockAdbRunner::new();
+        let config = AdbBridgeConfig {
+            remote_port: 8088,
+            local_port: 8088,
+            poll_interval: Duration::from_millis(10),
+            max_reconnect_attempts: 3,
+            require_quest_filter: false,
+            target_serial: None,
+        };
+
+        let mut bridge = AdbBridge::new(runner.clone(), config);
+        runner.add_device(AdbDevice {
+            serial: "QUEST_TEST".to_string(),
+            state: AdbDeviceState::Device,
+            product: None,
+            model: None,
+            device_name: None,
+            transport_id: None,
+        });
+
+        // Step 1: Connect and establish rule
+        let evt = bridge.poll_step().await.unwrap();
+        assert!(matches!(
+            evt,
+            Some(AdbBridgeEvent::ReversePortEstablished { .. })
+        ));
+        assert!(matches!(bridge.state(), AdbBridgeState::Connected { .. }));
+
+        // Step 2: Drop rule and inject reverse failure
+        runner.clear_rules("QUEST_TEST");
+        runner.set_fail_next(Some("adb server error".to_string()));
+
+        let evt = bridge.poll_step().await.unwrap();
+        assert!(
+            matches!(evt, Some(AdbBridgeEvent::Error(ref msg)) if msg.contains("adb server error"))
+        );
+        assert!(matches!(
+            bridge.state(),
+            AdbBridgeState::Reconnecting { .. }
+        ));
     }
 }

@@ -32,18 +32,10 @@ pub struct AdbDevice {
 
 impl AdbDevice {
     /// Checks whether the device matches a Meta Quest headset.
-    /// Matches models/products: Quest, Quest 2, Quest 3, Quest Pro, eureka, hollywood, seacliff, etc.
+    /// Matches known Quest codenames ("eureka", "hollywood", "seacliff", "monterey", "pacific")
+    /// and model tokens ("quest", "oculus"). Does not match bare substring "meta".
     pub fn is_quest(&self) -> bool {
-        let quest_signatures = [
-            "quest",
-            "eureka",
-            "hollywood",
-            "seacliff",
-            "monterey",
-            "pacific",
-            "oculus",
-            "meta",
-        ];
+        let quest_codenames = ["eureka", "hollywood", "seacliff", "monterey", "pacific"];
 
         let search_fields = [
             self.model.as_deref().unwrap_or(""),
@@ -53,8 +45,17 @@ impl AdbDevice {
 
         for field in &search_fields {
             let lower = field.to_lowercase();
-            for sig in &quest_signatures {
-                if lower.contains(sig) {
+            if lower.is_empty() {
+                continue;
+            }
+            if lower.contains("quest") || lower.contains("oculus") {
+                return true;
+            }
+            for codename in &quest_codenames {
+                if lower == *codename
+                    || lower.starts_with(&format!("{codename}_"))
+                    || lower.starts_with(&format!("{codename}-"))
+                {
                     return true;
                 }
             }
@@ -196,5 +197,28 @@ FA1234567890           unauthorized usb:1-2 transport_id:2
         assert_eq!(rules[0].local_port, 8088);
         assert_eq!(rules[1].remote_port, 9000);
         assert_eq!(rules[1].local_port, 9000);
+    }
+
+    #[test]
+    fn test_is_quest_does_not_match_bare_meta() {
+        let unrelated = AdbDevice {
+            serial: "RANDOM123".to_string(),
+            state: AdbDeviceState::Device,
+            product: Some("metadata_box".to_string()),
+            model: Some("meta_smart_device".to_string()),
+            device_name: Some("meta_watch".to_string()),
+            transport_id: Some("10".to_string()),
+        };
+        assert!(!unrelated.is_quest());
+
+        let quest = AdbDevice {
+            serial: "QUEST123".to_string(),
+            state: AdbDeviceState::Device,
+            product: Some("eureka".to_string()),
+            model: Some("Quest_3".to_string()),
+            device_name: Some("eureka".to_string()),
+            transport_id: Some("11".to_string()),
+        };
+        assert!(quest.is_quest());
     }
 }

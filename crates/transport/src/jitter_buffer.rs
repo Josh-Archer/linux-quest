@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use linux_quest_protocol::{Packet, PacketType, FLAG_FEC_PROTECTED};
+use linux_quest_protocol::{Packet, PacketHeader, PacketType, FLAG_FEC_PROTECTED};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,25 @@ struct FecBlockTracker {
     k: usize,
     m: usize,
     sources: HashMap<usize, (u32, Packet)>, // index_in_block -> (seq, Packet)
-    parities: Vec<(usize, Bytes)>,          // (parity_index, raw_bytes)
+    parities: HashMap<usize, Bytes>,        // parity_index -> raw_bytes
+}
+
+impl FecBlockTracker {
+    fn is_complete(&self) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        (0..self.k).all(|i| self.sources.contains_key(&i))
+    }
+
+    fn prune_invalid_indices(&mut self) {
+        if self.k > 0 {
+            self.sources.retain(|&idx, _| idx < self.k);
+        }
+        if self.m > 0 {
+            self.parities.retain(|&idx, _| idx < self.m);
+        }
+    }
 }
 
 /// Maximum number of active FEC blocks tracked simultaneously in memory.
@@ -142,10 +160,6 @@ impl AdaptiveJitterBuffer {
         let target_delay = self.current_target_delay();
         self.stats.current_target_delay_us = target_delay.as_micros() as u64;
 
-        if self.expected_sequence.is_none() {
-            self.expected_sequence = Some(packet.header.sequence);
-        }
-
         let seq = packet.header.sequence;
 
         // Handle FEC parity packet
@@ -168,15 +182,19 @@ impl AdaptiveJitterBuffer {
                         k: fec_header.source_count as usize,
                         m: fec_header.parity_count as usize,
                         sources: HashMap::new(),
-                        parities: Vec::new(),
+                        parities: HashMap::new(),
                     });
 
                 tracker.scheme = fec_header.scheme;
                 tracker.k = fec_header.source_count as usize;
                 tracker.m = fec_header.parity_count as usize;
+                tracker.prune_invalid_indices();
                 let p_idx = fec_header.parity_index as usize;
                 if tracker.m > 0 && p_idx < tracker.m {
-                    tracker.parities.push((p_idx, packet.payload.clone()));
+                    tracker
+                        .parities
+                        .entry(p_idx)
+                        .or_insert(packet.payload.clone());
                     self.try_fec_recovery(fec_header.block_id, now);
                 }
             }
@@ -200,7 +218,7 @@ impl AdaptiveJitterBuffer {
                     k: 0,
                     m: 0,
                     sources: HashMap::new(),
-                    parities: Vec::new(),
+                    parities: HashMap::new(),
                 });
 
             let idx = packet.header.fec_index() as usize;
@@ -240,11 +258,12 @@ impl AdaptiveJitterBuffer {
                 k,
                 m,
                 sources: HashMap::new(),
-                parities: Vec::new(),
+                parities: HashMap::new(),
             });
         tracker.scheme = scheme;
         tracker.k = k;
         tracker.m = m;
+        tracker.prune_invalid_indices();
     }
 
     /// Attempts FEC recovery on a block if enough data + parity packets are available.
@@ -256,13 +275,13 @@ impl AdaptiveJitterBuffer {
 
         let k = tracker.k;
         let m = tracker.m;
-        let available = tracker.sources.len() + tracker.parities.len();
 
-        if tracker.sources.len() == k {
+        if tracker.is_complete() {
             self.fec_blocks.remove(&block_id);
             return false;
         }
 
+        let available = tracker.sources.len() + tracker.parities.len();
         if available < k {
             return false;
         }
@@ -275,32 +294,35 @@ impl AdaptiveJitterBuffer {
 
         let recovered = match tracker.scheme {
             FecScheme::Xor => {
-                let parity = tracker.parities.first().map(|p| &p.1);
+                let parity = tracker.parities.get(&0);
                 XorFec::decode(block_id, k, source_payloads, parity)
             }
             FecScheme::ReedSolomon => {
-                ReedSolomonFec::decode(block_id, k, m, source_payloads, &tracker.parities)
+                let parities_vec: Vec<(usize, Bytes)> = tracker
+                    .parities
+                    .iter()
+                    .map(|(&idx, bytes)| (idx, bytes.clone()))
+                    .collect();
+                ReedSolomonFec::decode(block_id, k, m, source_payloads, &parities_vec)
             }
         };
 
         if let Ok(all_sources) = recovered {
-            // Find reference header to synthesize packet headers for recovered packets
-            let ref_header = tracker
-                .sources
-                .values()
-                .next()
-                .map(|(_, p)| p.header.clone());
+            let ref_entry = tracker.sources.values().next();
+            if let Some((ref_seq, ref_pkt)) = ref_entry {
+                let base_seq = ref_seq.saturating_sub(ref_pkt.header.fec_index() as u32);
+                let packet_type = ref_pkt.header.packet_type;
+                let stream_id = ref_pkt.header.stream_id;
+                let timestamp_us = ref_pkt.header.timestamp_us;
 
-            if let Some(ref header) = ref_header {
-                let base_seq = header.sequence.saturating_sub(header.fec_index() as u32);
                 for (idx, payload) in all_sources.into_iter().enumerate() {
                     if let std::collections::hash_map::Entry::Vacant(e) = tracker.sources.entry(idx)
                     {
-                        let mut rec_header = header.clone();
-                        rec_header.sequence = base_seq.saturating_add(idx as u32);
-                        rec_header = rec_header.with_fec_index(idx as u16);
-                        rec_header.payload_len = payload.len() as u32;
-                        rec_header.checksum = crc32fast::hash(&payload);
+                        let seq = base_seq.saturating_add(idx as u32);
+                        let rec_header =
+                            PacketHeader::new(packet_type, stream_id, seq, timestamp_us, &payload)
+                                .with_flags(FLAG_FEC_PROTECTED)
+                                .with_fec_index(idx as u16);
 
                         let recovered_packet = Packet::new(rec_header, payload);
                         self.queue.insert(
@@ -326,29 +348,32 @@ impl AdaptiveJitterBuffer {
     pub fn pop_ready_packet(&mut self, now: Instant) -> Option<Packet> {
         let target_delay = self.current_target_delay();
 
-        let (seq, ready) = {
-            let (first_seq, item) = self.queue.iter().next()?;
-            let age = now.duration_since(item.arrival_instant);
-            (*first_seq, age >= target_delay)
-        };
-
-        if ready {
-            let item = self.queue.remove(&seq)?;
-
+        while let Some((&first_seq, item)) = self.queue.iter().next() {
             if let Some(expected) = self.expected_sequence {
-                if seq > expected {
-                    self.stats.packets_lost += (seq - expected) as u64;
-                    self.expected_sequence = Some(seq + 1);
-                } else if seq == expected {
-                    self.expected_sequence = Some(seq + 1);
+                if first_seq < expected {
+                    // Packet arrived after playout cursor has already advanced past it; discard
+                    self.queue.remove(&first_seq);
+                    continue;
                 }
             }
 
-            self.stats.packets_delivered += 1;
-            Some(item.packet)
-        } else {
-            None
+            let age = now.duration_since(item.arrival_instant);
+            if age >= target_delay {
+                let item = self.queue.remove(&first_seq)?;
+                if let Some(expected) = self.expected_sequence {
+                    if first_seq > expected {
+                        self.stats.packets_lost += (first_seq - expected) as u64;
+                    }
+                }
+                self.expected_sequence = Some(first_seq + 1);
+                self.stats.packets_delivered += 1;
+                return Some(item.packet);
+            } else {
+                return None;
+            }
         }
+
+        None
     }
 
     /// Evicts ancient packets if queue exceeds maximum threshold to avoid bufferbloat.
@@ -458,5 +483,148 @@ mod tests {
 
         assert_eq!(jb.stats().packets_reconstructed_fec, 1);
         assert_eq!(jb.queue_len(), 3); // s0, reconstructed s1, s2
+    }
+
+    #[test]
+    fn test_jitter_buffer_duplicate_parity_recovery() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+
+        let block_id = 1000;
+        let sources = vec![
+            Bytes::from_static(b"data-0"),
+            Bytes::from_static(b"data-1"),
+            Bytes::from_static(b"data-2"),
+            Bytes::from_static(b"data-3"),
+        ];
+
+        let parities = ReedSolomonFec::encode(block_id, &sources, 2).unwrap();
+        jb.register_fec_block(block_id, 4, 2);
+
+        // Sources 0 and 1 arrive (sources 2 and 3 dropped)
+        for (i, source) in sources.iter().enumerate().take(2) {
+            let p = Packet::new(
+                PacketHeader::new(
+                    PacketType::VideoFrameChunk,
+                    0,
+                    100 + i as u32,
+                    block_id,
+                    source,
+                )
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(i as u16),
+                source.clone(),
+            );
+            jb.ingest_packet(p, now);
+        }
+
+        // Parity 0 arrives twice (network duplication)
+        let parity0_dup1 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 200, block_id, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+        let parity0_dup2 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 201, block_id, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+        jb.ingest_packet(parity0_dup1, now);
+        jb.ingest_packet(parity0_dup2, now);
+
+        // Parity 1 arrives
+        let parity1 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 202, block_id, &parities[1])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[1].clone(),
+        );
+        jb.ingest_packet(parity1, now);
+
+        // All 4 source packets must be recovered despite duplicate parity
+        assert_eq!(jb.stats().packets_reconstructed_fec, 2);
+        assert_eq!(jb.queue_len(), 4);
+    }
+
+    #[test]
+    fn test_jitter_buffer_clean_reconstructed_flags() {
+        use linux_quest_protocol::{FLAG_KEYFRAME, FLAG_LAST_CHUNK};
+
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+
+        let block_id = 2000;
+        let s0 = Bytes::from_static(b"chunk0");
+        let s1 = Bytes::from_static(b"chunk1");
+        let s2 = Bytes::from_static(b"chunk2");
+
+        let sources = vec![s0.clone(), s1.clone(), s2.clone()];
+        let parities = ReedSolomonFec::encode(block_id, &sources, 1).unwrap();
+        jb.register_fec_block(block_id, 3, 1);
+
+        // Chunk 0 has KEYFRAME
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, &s0)
+                .with_flags(FLAG_FEC_PROTECTED | FLAG_KEYFRAME)
+                .with_fec_index(0),
+            s0,
+        );
+        // Chunk 2 has LAST_CHUNK
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 12, block_id, &s2)
+                .with_flags(FLAG_FEC_PROTECTED | FLAG_LAST_CHUNK)
+                .with_fec_index(2),
+            s2,
+        );
+        let parity_pkt = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 13, block_id, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+
+        jb.ingest_packet(p0, now);
+        jb.ingest_packet(p2, now);
+        jb.ingest_packet(parity_pkt, now);
+
+        assert_eq!(jb.stats().packets_reconstructed_fec, 1);
+
+        let playout = now + Duration::from_millis(50);
+        let pkt0 = jb.pop_ready_packet(playout).unwrap();
+        let pkt1 = jb.pop_ready_packet(playout).unwrap();
+        let pkt2 = jb.pop_ready_packet(playout).unwrap();
+
+        assert_eq!(pkt0.header.sequence, 10);
+        assert_eq!(pkt1.header.sequence, 11);
+        assert_eq!(pkt2.header.sequence, 12);
+
+        // Recovered chunk 1 MUST NOT copy KEYFRAME or LAST_CHUNK flags
+        assert_eq!(pkt1.header.flags, FLAG_FEC_PROTECTED);
+    }
+
+    #[test]
+    fn test_jitter_buffer_late_packet_discard() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+
+        // Ingest sequence 5
+        let p5 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 5, 5000, b"p5"),
+            Bytes::from_static(b"p5"),
+        );
+        jb.ingest_packet(p5, now);
+
+        let playout = now + Duration::from_millis(50);
+        let popped = jb.pop_ready_packet(playout).unwrap();
+        assert_eq!(popped.header.sequence, 5);
+
+        // Now late packet sequence 4 arrives
+        let p4 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 4, 4000, b"p4"),
+            Bytes::from_static(b"p4"),
+        );
+        jb.ingest_packet(p4, now);
+
+        // Popping must discard late sequence 4 and return None
+        assert!(jb.pop_ready_packet(playout).is_none());
+        assert_eq!(jb.stats().packets_delivered, 1);
     }
 }
