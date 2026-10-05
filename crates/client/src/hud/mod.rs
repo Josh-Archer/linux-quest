@@ -1,5 +1,7 @@
 //! Debug HUD overlay rendering FPS, frame pacing, and latency metrics.
 
+pub mod font;
+
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -156,6 +158,19 @@ impl DebugHud {
             }
         }
 
+        // Draw telemetry text using 5x7 font
+        let text = self.formatted_text();
+        font::draw_text_rgba(
+            &mut buffer,
+            self.hud_width,
+            self.hud_height,
+            16,
+            bar_height + 12,
+            2,
+            &text,
+            [255, 255, 255, 255],
+        );
+
         buffer
     }
 
@@ -188,6 +203,7 @@ mod tests {
             wait_frame_duration_us: 1200,
             render_duration_us: 300,
             predicted_display_time: 1_000_000,
+            should_render: true,
         };
         let stats = DecoderStats {
             last_latency_us: 2400,
@@ -204,5 +220,6 @@ mod tests {
 
         let rgba = hud.render_to_rgba();
         assert_eq!(rgba.len(), 256 * 128 * 4);
+        assert!(rgba.as_chunks::<4>().0.contains(&[255, 255, 255, 255]));
     }
 }

@@ -85,6 +85,7 @@ fn test_debug_hud_rendering_and_telemetry() {
         wait_frame_duration_us: 500,
         render_duration_us: 200,
         predicted_display_time: 1_000_000,
+        should_render: true,
     };
     let stats = DecoderStats {
         last_latency_us: 2800,

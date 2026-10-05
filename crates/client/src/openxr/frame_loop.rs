@@ -16,6 +16,8 @@ pub struct FramePacingMetrics {
     pub motion_to_photon_latency_us: u64,
     /// Predicted display presentation time.
     pub predicted_display_time: i64,
+    /// Whether OpenXR runtime requests that layers should be rendered this frame.
+    pub should_render: bool,
 }
 
 /// Orchestrates the OpenXR frame pacing loop synchronized to headset refresh rates.
@@ -54,7 +56,7 @@ impl FrameLoopEngine {
             11_111 // 90 Hz default
         };
 
-        let predicted_time = if context.is_simulated() {
+        let (predicted_time, should_render) = if context.is_simulated() {
             // In simulation mode, pace according to target refresh rate
             let elapsed = self.last_frame_instant.elapsed().as_micros() as u64;
             if elapsed < budget_us {
@@ -62,13 +64,16 @@ impl FrameLoopEngine {
                 std::thread::sleep(sleep_duration);
             }
             self.frame_counter += 1;
-            self.frame_counter as i64 * (budget_us as i64 * 1000)
+            (self.frame_counter as i64 * (budget_us as i64 * 1000), true)
         } else {
             // In live mode, OpenXR FrameWaiter blocks until the display pacing slot
             let frame_state = context.wait_frame()?;
             context.begin_frame()?;
             self.frame_counter += 1;
-            frame_state.predicted_display_time.as_nanos()
+            (
+                frame_state.predicted_display_time.as_nanos(),
+                frame_state.should_render,
+            )
         };
 
         let wait_duration = wait_start.elapsed().as_micros() as u64;
@@ -79,15 +84,17 @@ impl FrameLoopEngine {
             render_duration_us: 0,
             motion_to_photon_latency_us: budget_us,
             predicted_display_time: predicted_time,
+            should_render,
         };
 
         self.last_pacing_metrics = metrics.clone();
         Ok(metrics)
     }
 
-    /// Records completed frame render duration.
+    /// Records completed frame render duration and updates motion-to-photon latency.
     pub fn record_render_duration(&mut self, duration_us: u64) {
         self.last_pacing_metrics.render_duration_us = duration_us;
+        self.last_pacing_metrics.motion_to_photon_latency_us += duration_us;
     }
 
     /// Returns the most recent frame pacing metrics.
@@ -115,5 +122,6 @@ mod tests {
         let metrics = engine.wait_frame_pacing(&ctx).unwrap();
         assert_eq!(engine.frame_counter(), 1);
         assert!(metrics.predicted_display_time > 0);
+        assert!(metrics.should_render);
     }
 }

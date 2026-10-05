@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use ash::vk;
 use ash::vk::Handle;
+#[cfg(target_os = "android")]
+use openxr::sys::Handle as _;
 use openxr::{
     ApplicationInfo, CompositionLayerBase, Entry, EnvironmentBlendMode, ExtensionSet, FormFactor,
     FrameState, FrameStream, FrameWaiter, Instance, Session, SessionState, Space, Swapchain,
@@ -28,6 +30,9 @@ pub struct OpenXrContext {
     view_space: Option<Space>,
     desktop_swapchain: Option<Swapchain<Vulkan>>,
     hud_swapchain: Option<Swapchain<Vulkan>>,
+    hud_images: Vec<vk::Image>,
+    #[cfg(target_os = "android")]
+    surface_window: Option<ndk::native_window::NativeWindow>,
     refresh_rate_manager: Option<RefreshRateManager>,
     session_state: SessionState,
     session_running: Arc<AtomicBool>,
@@ -51,6 +56,9 @@ impl OpenXrContext {
             view_space: None,
             desktop_swapchain: None,
             hud_swapchain: None,
+            hud_images: Vec::new(),
+            #[cfg(target_os = "android")]
+            surface_window: None,
             refresh_rate_manager: Some(refresh_mgr),
             session_state: SessionState::FOCUSED,
             session_running: Arc::new(AtomicBool::new(true)),
@@ -292,18 +300,110 @@ impl OpenXrContext {
         };
 
         // Create initial swapchains
-        let desktop_info = SwapchainCreateInfo {
-            create_flags: SwapchainCreateFlags::EMPTY,
-            usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,
-            format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
-            sample_count: 1,
-            width: 1920,
-            height: 1080,
-            face_count: 1,
-            array_size: 1,
-            mip_count: 1,
+        #[cfg(target_os = "android")]
+        let (desktop_swapchain, surface_window) = if available_exts.khr_android_surface_swapchain {
+            let pfn = unsafe {
+                openxr::raw::AndroidSurfaceSwapchainKHR::load(&entry, instance.as_raw()).map_err(
+                    |e| {
+                        ClientError::OpenXr(format!(
+                            "Failed to load AndroidSurfaceSwapchainKHR: {e:?}"
+                        ))
+                    },
+                )?
+            };
+            let info = openxr::sys::SwapchainCreateInfo {
+                ty: openxr::sys::StructureType::SWAPCHAIN_CREATE_INFO,
+                next: std::ptr::null(),
+                create_flags: openxr::sys::SwapchainCreateFlags::EMPTY,
+                usage_flags: openxr::sys::SwapchainUsageFlags::COLOR_ATTACHMENT
+                    | openxr::sys::SwapchainUsageFlags::SAMPLED,
+                format: vk::Format::R8G8B8A8_UNORM.as_raw() as i64,
+                sample_count: 1,
+                width: config.stream_width,
+                height: config.stream_height,
+                face_count: 1,
+                array_size: 1,
+                mip_count: 1,
+            };
+            let mut raw_swapchain = openxr::sys::Swapchain::NULL;
+            let mut surface: openxr::sys::platform::jobject = std::ptr::null_mut();
+            let res = unsafe {
+                (pfn.create_swapchain_android_surface)(
+                    session.as_raw(),
+                    &info,
+                    &mut raw_swapchain,
+                    &mut surface,
+                )
+            };
+            if res.into_raw() < 0 {
+                return Err(ClientError::OpenXr(format!(
+                    "xrCreateSwapchainAndroidSurfaceKHR failed with error code {}",
+                    res.into_raw()
+                )));
+            }
+            let native_window = if !surface.is_null() {
+                let ctx = ndk_context::android_context();
+                let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }
+                    .map_err(|e| ClientError::OpenXr(format!("JNI JavaVM error: {e:?}")))?;
+                let env_raw = match vm.get_env() {
+                    Ok(env) => env.get_raw(),
+                    Err(_) => {
+                        let guard = vm.attach_current_thread().map_err(|e| {
+                            ClientError::OpenXr(format!("JNI attach thread failed: {e:?}"))
+                        })?;
+                        guard.get_raw()
+                    }
+                };
+                let win = unsafe { ndk_sys::ANativeWindow_fromSurface(env_raw as _, surface as _) };
+                if win.is_null() {
+                    return Err(ClientError::OpenXr(
+                        "ANativeWindow_fromSurface returned NULL".into(),
+                    ));
+                }
+                std::ptr::NonNull::new(win)
+                    .map(|ptr| unsafe { ndk::native_window::NativeWindow::from_ptr(ptr) })
+            } else {
+                None
+            };
+            let sc =
+                unsafe { openxr::Swapchain::<Vulkan>::from_raw(session.clone(), raw_swapchain) };
+            (Some(sc), native_window)
+        } else {
+            let desktop_info = SwapchainCreateInfo {
+                create_flags: SwapchainCreateFlags::EMPTY,
+                usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,
+                format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
+                sample_count: 1,
+                width: config.stream_width,
+                height: config.stream_height,
+                face_count: 1,
+                array_size: 1,
+                mip_count: 1,
+            };
+            let sc = session.create_swapchain(&desktop_info).map_err(|e| {
+                ClientError::OpenXr(format!("Failed to create desktop swapchain: {e:?}"))
+            })?;
+            (Some(sc), None)
         };
-        let desktop_swapchain = session.create_swapchain(&desktop_info).ok();
+
+        #[cfg(not(target_os = "android"))]
+        let desktop_swapchain = {
+            let desktop_info = SwapchainCreateInfo {
+                create_flags: SwapchainCreateFlags::EMPTY,
+                usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,
+                format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
+                sample_count: 1,
+                width: config.stream_width,
+                height: config.stream_height,
+                face_count: 1,
+                array_size: 1,
+                mip_count: 1,
+            };
+            let sc = session.create_swapchain(&desktop_info).map_err(|e| {
+                ClientError::OpenXr(format!("Failed to create desktop swapchain: {e:?}"))
+            })?;
+            Some(sc)
+        };
 
         let hud_info = SwapchainCreateInfo {
             create_flags: SwapchainCreateFlags::EMPTY,
@@ -316,7 +416,18 @@ impl OpenXrContext {
             array_size: 1,
             mip_count: 1,
         };
-        let hud_swapchain = session.create_swapchain(&hud_info).ok();
+        let hud_swapchain = session
+            .create_swapchain(&hud_info)
+            .map_err(|e| ClientError::OpenXr(format!("Failed to create HUD swapchain: {e:?}")))?;
+
+        let hud_images = hud_swapchain
+            .enumerate_images()
+            .map(|imgs| {
+                imgs.into_iter()
+                    .map(|raw| vk::Image::from_raw(raw as _))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(Self {
             instance: Some(instance),
@@ -327,7 +438,10 @@ impl OpenXrContext {
             stage_space: Some(stage_space),
             view_space: Some(view_space),
             desktop_swapchain,
-            hud_swapchain,
+            hud_swapchain: Some(hud_swapchain),
+            hud_images,
+            #[cfg(target_os = "android")]
+            surface_window,
             refresh_rate_manager,
             session_state: SessionState::IDLE,
             session_running: Arc::new(AtomicBool::new(false)),
@@ -339,6 +453,32 @@ impl OpenXrContext {
     /// Whether this OpenXR context is running in simulated/mock mode.
     pub fn is_simulated(&self) -> bool {
         self.is_simulated
+    }
+
+    /// Returns the target Android native window surface if an Android surface swapchain is active.
+    #[cfg(target_os = "android")]
+    pub fn surface_window(&self) -> Option<&ndk::native_window::NativeWindow> {
+        self.surface_window.as_ref()
+    }
+
+    /// Requests a dynamic display refresh rate change from the OpenXR runtime.
+    pub fn request_refresh_rate(&mut self, target_rate: f32) -> ClientResult<()> {
+        let best = if let Some(mgr) = self.refresh_rate_manager.as_ref() {
+            mgr.find_closest_supported_rate(target_rate)
+        } else {
+            return Ok(());
+        };
+
+        if let Some(session) = &self.session {
+            session.request_display_refresh_rate(best).map_err(|e| {
+                ClientError::OpenXr(format!("Failed to request refresh rate {best}: {e:?}"))
+            })?;
+        }
+
+        if let Some(mgr) = self.refresh_rate_manager.as_mut() {
+            mgr.on_refresh_rate_changed(best);
+        }
+        Ok(())
     }
 
     /// Returns current OpenXR session state.
@@ -544,10 +684,15 @@ impl OpenXrContext {
         &mut self,
         display_time: Time,
         config: &ClientConfig,
+        vulkan_context: &VulkanContext,
+        hud_rgba: Option<&[u8]>,
     ) -> ClientResult<()> {
         if self.is_simulated {
             return Ok(());
         }
+
+        let stream_width = config.stream_width;
+        let stream_height = config.stream_height;
 
         if let (Some(space), Some(desktop_sc)) = (&self.stage_space, &mut self.desktop_swapchain) {
             let _ = desktop_sc.acquire_image();
@@ -575,17 +720,25 @@ impl OpenXrContext {
                 let cyl_layer = crate::openxr::layers::build_cylinder_layer(
                     space,
                     desktop_sc,
-                    1920,
-                    1080,
+                    stream_width,
+                    stream_height,
                     &desktop_cfg,
                 );
                 if config.enable_hud {
                     if let (Some(view_space), Some(hud_sc)) =
                         (&self.view_space, &mut self.hud_swapchain)
                     {
-                        let _ = hud_sc.acquire_image();
-                        let _ = hud_sc.wait_image(openxr::Duration::INFINITE);
-                        let _ = hud_sc.release_image();
+                        if let Ok(idx) = hud_sc.acquire_image() {
+                            if hud_sc.wait_image(openxr::Duration::INFINITE).is_ok() {
+                                if let Some(rgba) = hud_rgba {
+                                    if let Some(&img) = self.hud_images.get(idx as usize) {
+                                        let _ = vulkan_context
+                                            .upload_rgba_to_image(img, 512, 256, rgba);
+                                    }
+                                }
+                                let _ = hud_sc.release_image();
+                            }
+                        }
                         let hud_layer =
                             crate::openxr::layers::build_hud_layer(view_space, hud_sc, 512, 256);
                         let _ = stream.end(
@@ -604,17 +757,25 @@ impl OpenXrContext {
                 let quad_layer = crate::openxr::layers::build_quad_layer(
                     space,
                     desktop_sc,
-                    1920,
-                    1080,
+                    stream_width,
+                    stream_height,
                     &desktop_cfg,
                 );
                 if config.enable_hud {
                     if let (Some(view_space), Some(hud_sc)) =
                         (&self.view_space, &mut self.hud_swapchain)
                     {
-                        let _ = hud_sc.acquire_image();
-                        let _ = hud_sc.wait_image(openxr::Duration::INFINITE);
-                        let _ = hud_sc.release_image();
+                        if let Ok(idx) = hud_sc.acquire_image() {
+                            if hud_sc.wait_image(openxr::Duration::INFINITE).is_ok() {
+                                if let Some(rgba) = hud_rgba {
+                                    if let Some(&img) = self.hud_images.get(idx as usize) {
+                                        let _ = vulkan_context
+                                            .upload_rgba_to_image(img, 512, 256, rgba);
+                                    }
+                                }
+                                let _ = hud_sc.release_image();
+                            }
+                        }
                         let hud_layer =
                             crate::openxr::layers::build_hud_layer(view_space, hud_sc, 512, 256);
                         let _ = stream.end(
@@ -653,7 +814,13 @@ mod tests {
 
         assert!(ctx.poll_events().is_ok());
 
+        assert!(ctx.request_refresh_rate(120.0).is_ok());
         let refresh_mgr = ctx.refresh_rate_manager().unwrap();
-        assert_eq!(refresh_mgr.current_rate(), 90.0);
+        assert_eq!(refresh_mgr.current_rate(), 120.0);
+
+        let vk_ctx = VulkanContext::new_simulated();
+        assert!(ctx
+            .render_and_present_layers(Time::from_nanos(1), &config, &vk_ctx, None)
+            .is_ok());
     }
 }

@@ -82,4 +82,12 @@ pub trait HardwareVideoDecoder: Send {
 
     /// Returns current telemetry statistics from the decoder.
     fn stats(&self) -> DecoderStats;
+
+    /// Configures an Android native surface window (`*mut ANativeWindow` as `*mut std::ffi::c_void`) for zero-copy rendering.
+    ///
+    /// # Safety
+    /// The window pointer must point to a valid `ANativeWindow` on Android, or null to detach.
+    unsafe fn set_surface_window(&mut self, _window: *mut std::ffi::c_void) -> ClientResult<()> {
+        Ok(())
+    }
 }

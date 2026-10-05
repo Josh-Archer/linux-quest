@@ -93,6 +93,12 @@ pub struct ClientConfig {
     /// Maximum capacity of the jitter buffer in packets.
     pub jitter_buffer_max_depth: usize,
 
+    /// Virtual monitor horizontal stream resolution in pixels (default 1920).
+    pub stream_width: u32,
+
+    /// Virtual monitor vertical stream resolution in pixels (default 1080).
+    pub stream_height: u32,
+
     /// Force using mock decoder for testing or simulation.
     pub force_mock_decoder: bool,
 }
@@ -113,6 +119,8 @@ impl Default for ClientConfig {
             enable_hud: true,
             jitter_buffer_initial_depth_ms: 4,
             jitter_buffer_max_depth: 512,
+            stream_width: 1920,
+            stream_height: 1080,
             #[cfg(target_os = "android")]
             force_mock_decoder: false,
             #[cfg(not(target_os = "android"))]
@@ -172,6 +180,12 @@ impl ClientConfig {
                 "Invalid jitter buffer max depth: {} (expected 16-4096)",
                 self.jitter_buffer_max_depth
             )));
+        }
+
+        if self.stream_width == 0 || self.stream_height == 0 {
+            return Err(ClientError::Config(
+                "Stream resolution width and height must be non-zero".into(),
+            ));
         }
 
         Ok(())

@@ -40,7 +40,16 @@ impl QuestClientRuntime {
             }
         };
 
-        let decoder = create_decoder(&config, 1920, 1080);
+        #[allow(unused_mut)]
+        let mut decoder = create_decoder(&config, config.stream_width, config.stream_height);
+        #[cfg(target_os = "android")]
+        if let Some(win) = openxr_context.surface_window() {
+            unsafe {
+                let _ = decoder.set_surface_window(win.ptr().as_ptr() as *mut std::ffi::c_void);
+            }
+            let _ = decoder.init(config.stream_width, config.stream_height, config.codec);
+        }
+
         let receiver = ClientReceiver::new(&config);
         let frame_loop = FrameLoopEngine::new();
         let hud = DebugHud::new(512, 256);
@@ -76,6 +85,13 @@ impl QuestClientRuntime {
 
         // 2. Pace rendering loop to target headset refresh rate (72Hz, 90Hz, 120Hz)
         let pacing = self.frame_loop.wait_frame_pacing(&self.openxr_context)?;
+        let display_time = openxr::Time::from_nanos(pacing.predicted_display_time);
+
+        // If OpenXR requests not to render (should_render == false), end frame with empty layers
+        if !pacing.should_render {
+            self.openxr_context.end_frame_empty(display_time)?;
+            return Ok(pacing);
+        }
 
         // 3. Pop completed video frames whose playout delay has elapsed at the current moment
         let playout_instant = if self.openxr_context.is_simulated() {
@@ -84,23 +100,24 @@ impl QuestClientRuntime {
             Instant::now()
         };
 
-        let ready_frames = self.receiver.pop_ready_frames(playout_instant)?;
-        for frame in ready_frames {
-            if let Err(e) = self.decoder.queue_input_buffer(
-                &frame.bitstream,
-                frame.meta.pts_us,
-                frame.meta.is_keyframe,
-            ) {
-                tracing::warn!(
-                    error = ?e,
-                    frame_id = frame.meta.frame_id,
-                    "Failed to queue video frame into decoder"
-                );
+        if let Ok(ready_frames) = self.receiver.pop_ready_frames(playout_instant) {
+            for frame in ready_frames {
+                if let Err(e) = self.decoder.queue_input_buffer(
+                    &frame.bitstream,
+                    frame.meta.pts_us,
+                    frame.meta.is_keyframe,
+                ) {
+                    tracing::warn!(
+                        error = ?e,
+                        frame_id = frame.meta.frame_id,
+                        "Failed to queue video frame into decoder"
+                    );
+                }
             }
         }
 
         // 4. Dequeue and release hardware-decoded video frames direct to OpenXR surface
-        while let Some(frame) = self.decoder.dequeue_output_buffer(0)? {
+        while let Ok(Some(frame)) = self.decoder.dequeue_output_buffer(0) {
             let _ = self.decoder.release_output_buffer(frame.buffer_index, true);
         }
 
@@ -116,9 +133,24 @@ impl QuestClientRuntime {
         );
 
         // 6. Submit composition layers to OpenXR compositor for timewarp display
-        let display_time = openxr::Time::from_nanos(pacing.predicted_display_time);
-        self.openxr_context
-            .render_and_present_layers(display_time, &self.config)?;
+        let hud_rgba = if self.config.enable_hud {
+            Some(self.hud.render_to_rgba())
+        } else {
+            None
+        };
+
+        let present_res = self.openxr_context.render_and_present_layers(
+            display_time,
+            &self.config,
+            &self.vulkan_context,
+            hud_rgba.as_deref(),
+        );
+
+        if let Err(e) = present_res {
+            tracing::warn!(error = ?e, "Layer presentation failed; submitting empty frame");
+            let _ = self.openxr_context.end_frame_empty(display_time);
+            return Err(e);
+        }
 
         // 7. Record render duration
         let render_duration = render_start.elapsed().as_micros() as u64;
@@ -135,10 +167,7 @@ impl QuestClientRuntime {
     /// Requests a dynamic display refresh rate change.
     pub fn set_target_refresh_rate(&mut self, target_rate: f32) {
         self.config.target_refresh_rate = target_rate;
-        if let Some(mgr) = self.openxr_context.refresh_rate_manager_mut() {
-            let best = mgr.find_closest_supported_rate(target_rate);
-            mgr.on_refresh_rate_changed(best);
-        }
+        let _ = self.openxr_context.request_refresh_rate(target_rate);
     }
 
     /// Returns the current HUD telemetry text.
@@ -153,7 +182,12 @@ impl QuestClientRuntime {
 
     /// Whether the client runtime is actively running.
     pub fn is_running(&self) -> bool {
-        self.is_running && self.openxr_context.is_session_running()
+        self.is_running
+    }
+
+    /// Whether the OpenXR session has transitioned to running.
+    pub fn is_session_running(&self) -> bool {
+        self.openxr_context.is_session_running()
     }
 
     /// Returns a reference to the Vulkan context.

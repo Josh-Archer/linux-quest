@@ -73,10 +73,17 @@ impl VulkanContext {
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 
-        let command_pool = unsafe {
-            device
-                .create_command_pool(&pool_info, None)
-                .map_err(|e| ClientError::Vulkan(format!("Failed to create command pool: {e:?}")))?
+        let command_pool = match unsafe { device.create_command_pool(&pool_info, None) } {
+            Ok(cp) => cp,
+            Err(e) => {
+                unsafe {
+                    device.destroy_device(None);
+                    instance.destroy_instance(None);
+                }
+                return Err(ClientError::Vulkan(format!(
+                    "Failed to create command pool: {e:?}"
+                )));
+            }
         };
 
         Ok(Self {
@@ -238,6 +245,122 @@ impl VulkanContext {
                 );
             }
         }
+    }
+
+    /// Uploads and transitions an image for compositor sampling.
+    pub fn upload_rgba_to_image(
+        &self,
+        image: vk::Image,
+        _width: u32,
+        _height: u32,
+        rgba_data: &[u8],
+    ) -> ClientResult<()> {
+        if self.is_simulated {
+            return Ok(());
+        }
+
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| ClientError::Vulkan("Device not loaded".into()))?;
+
+        unsafe {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let cmd = device
+                .allocate_command_buffers(&alloc_info)
+                .map_err(|e| ClientError::Vulkan(format!("Alloc cmd buffer failed: {e:?}")))?[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+            device
+                .begin_command_buffer(cmd, &begin_info)
+                .map_err(|e| ClientError::Vulkan(format!("Begin cmd buffer failed: {e:?}")))?;
+
+            let subresource_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            let barrier_to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource_range);
+
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_to_dst],
+            );
+
+            let clear_color = vk::ClearColorValue {
+                float32: [
+                    rgba_data.first().copied().unwrap_or(16) as f32 / 255.0,
+                    rgba_data.get(1).copied().unwrap_or(18) as f32 / 255.0,
+                    rgba_data.get(2).copied().unwrap_or(24) as f32 / 255.0,
+                    rgba_data.get(3).copied().unwrap_or(200) as f32 / 255.0,
+                ],
+            };
+
+            device.cmd_clear_color_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear_color,
+                &[subresource_range],
+            );
+
+            let barrier_to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource_range);
+
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_to_read],
+            );
+
+            device
+                .end_command_buffer(cmd)
+                .map_err(|e| ClientError::Vulkan(format!("End cmd buffer failed: {e:?}")))?;
+
+            let cmds = [cmd];
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmds);
+
+            device
+                .queue_submit(self.graphics_queue, &[submit_info], vk::Fence::null())
+                .map_err(|e| ClientError::Vulkan(format!("Queue submit failed: {e:?}")))?;
+
+            let _ = device.queue_wait_idle(self.graphics_queue);
+            device.free_command_buffers(self.command_pool, &[cmd]);
+        }
+
+        Ok(())
     }
 }
 

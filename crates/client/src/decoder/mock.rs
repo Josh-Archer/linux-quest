@@ -372,6 +372,7 @@ impl HardwareVideoDecoder for MockHardwareDecoder {
 
     fn flush(&mut self) -> ClientResult<()> {
         self.output_queue.clear();
+        self.enqueue_timestamps.clear();
         Ok(())
     }
 

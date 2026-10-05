@@ -359,6 +359,7 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
     }
 
     fn flush(&mut self) -> ClientResult<()> {
+        self.enqueue_timestamps.clear();
         if !self.codec_ptr.is_null() {
             let status = unsafe { ndk_sys::AMediaCodec_flush(self.codec_ptr) };
             if status.0 != 0 {
@@ -372,6 +373,11 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
 
     fn stats(&self) -> DecoderStats {
         self.stats.clone()
+    }
+
+    unsafe fn set_surface_window(&mut self, window: *mut std::ffi::c_void) -> ClientResult<()> {
+        self.surface_window_ptr = window as *mut ndk_sys::ANativeWindow;
+        Ok(())
     }
 }
 

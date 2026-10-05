@@ -37,6 +37,44 @@ pub fn android_main(app: AndroidApp) {
         }
     };
 
+    // Background transport packet receiver
+    let (packet_tx, packet_rx) = std::sync::mpsc::channel();
+    let running_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let bg_running = running_flag.clone();
+
+    let _receiver_handle = std::thread::spawn(move || {
+        let socket = match std::net::UdpSocket::bind("0.0.0.0:48440") {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = ?e, "Failed to bind UDP socket on 0.0.0.0:48440");
+                return;
+            }
+        };
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+        let mut buf = [0u8; 65536];
+
+        while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
+            match socket.recv_from(&mut buf) {
+                Ok((len, _src)) => {
+                    match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
+                        Ok(packet) => {
+                            let _ = packet_tx.send(packet);
+                        }
+                        Err(e) => {
+                            tracing::trace!(error = ?e, "Failed to parse incoming packet");
+                        }
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    tracing::trace!(error = ?e, "UDP socket recv error");
+                }
+            }
+        }
+    });
+
     let mut is_active = false;
 
     // Main Android event and render loop
@@ -68,12 +106,19 @@ pub fn android_main(app: AndroidApp) {
             },
         );
 
+        // Ingest any received transport packets
+        while let Ok(pkt) = packet_rx.try_recv() {
+            runtime.ingest_packet(pkt, std::time::Instant::now());
+        }
+
         if is_active {
             if let Err(e) = runtime.step_frame() {
                 tracing::warn!(error = ?e, "Error stepping client frame");
             }
         }
     }
+
+    running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
 
     unsafe {
         ndk_context::release_android_context();
