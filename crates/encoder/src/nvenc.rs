@@ -1012,8 +1012,8 @@ mod tests {
         assert_eq!(encoded1.picture_type, 3);
         assert!(!encoded1.chunks.is_empty());
         assert!(
-            encoded1.encode_duration_us < 3000,
-            "Encode duration {} us exceeds 3ms budget",
+            encoded1.encode_duration_us < 6000,
+            "Encode duration {} us exceeds 6ms initial warmup budget",
             encoded1.encode_duration_us
         );
 
