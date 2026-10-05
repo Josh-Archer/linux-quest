@@ -13,5 +13,9 @@ tokio.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+serde.workspace = true
+bincode.workspace = true
+parking_lot.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]

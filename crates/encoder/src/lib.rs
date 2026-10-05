@@ -38,7 +38,7 @@ impl Default for EncoderConfig {
             fps: 90,
             bitrate_kbps: 80_000,
             intra_refresh_period: 30,
-            max_chunk_size: 1400,
+            max_chunk_size: 1200,
         }
     }
 }

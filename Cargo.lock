@@ -162,8 +162,12 @@ name = "linux-quest-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "bytes",
+ "crc32fast",
  "linux-quest-protocol",
+ "parking_lot",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
