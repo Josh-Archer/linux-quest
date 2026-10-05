@@ -161,13 +161,23 @@ impl AdaptiveJitterBuffer {
                     }
                 }
 
+                let src_cnt = fec_header.source_count as usize;
+                let par_cnt = fec_header.parity_count as usize;
+                let p_idx = fec_header.parity_index as usize;
+
+                // Validate FEC dimensions: k >= 1, m >= 1, k + m <= 256, parity_index < m
+                if src_cnt == 0 || par_cnt == 0 || src_cnt + par_cnt > MAX_FEC_K || p_idx >= par_cnt
+                {
+                    return;
+                }
+
                 let tracker = self
                     .fec_blocks
                     .entry(fec_header.block_id)
                     .or_insert_with(|| FecBlockTracker {
                         scheme: fec_header.scheme,
-                        k: fec_header.source_count as usize,
-                        m: fec_header.parity_count as usize,
+                        k: src_cnt,
+                        m: par_cnt,
                         base_sequence: None,
                         first_arrival: now,
                         sources: HashMap::new(),
@@ -175,11 +185,10 @@ impl AdaptiveJitterBuffer {
                     });
 
                 tracker.scheme = fec_header.scheme;
-                tracker.k = fec_header.source_count as usize;
-                tracker.m = fec_header.parity_count as usize;
+                tracker.k = src_cnt;
+                tracker.m = par_cnt;
                 tracker.prune_invalid_indices();
-                let p_idx = fec_header.parity_index as usize;
-                if tracker.m > 0 && p_idx < tracker.m {
+                if tracker.parities.len() < tracker.m {
                     tracker
                         .parities
                         .entry(p_idx)
@@ -241,7 +250,7 @@ impl AdaptiveJitterBuffer {
 
             let idx = packet.header.fec_index() as usize;
             let valid_idx = if tracker.k > 0 {
-                idx < tracker.k
+                idx < tracker.k && tracker.sources.len() < tracker.k
             } else {
                 idx < MAX_FEC_K && tracker.sources.len() < MAX_FEC_K
             };
@@ -291,6 +300,9 @@ impl AdaptiveJitterBuffer {
         m: usize,
         scheme: FecScheme,
     ) {
+        if k == 0 || m == 0 || k + m > MAX_FEC_K {
+            return;
+        }
         let tracker = self
             .fec_blocks
             .entry(block_id)
@@ -365,7 +377,7 @@ impl AdaptiveJitterBuffer {
                 for (idx, payload) in all_sources.into_iter().enumerate() {
                     if let std::collections::hash_map::Entry::Vacant(e) = tracker.sources.entry(idx)
                     {
-                        let seq = base_seq.saturating_add(idx as u32);
+                        let seq = base_seq.wrapping_add(idx as u32);
                         if !self.queue.contains_key(&seq) {
                             let rec_header = PacketHeader::new(
                                 packet_type,
@@ -416,8 +428,9 @@ impl AdaptiveJitterBuffer {
                 None => continue,
             };
 
-            if missing_seq >= base_seq && missing_seq < base_seq + (k as u32) {
-                let missing_idx = (missing_seq - base_seq) as usize;
+            let offset = missing_seq.wrapping_sub(base_seq);
+            if offset < (k as u32) {
+                let missing_idx = offset as usize;
                 if !tracker.sources.contains_key(&missing_idx) {
                     let missing_count = k.saturating_sub(tracker.sources.len());
                     if missing_count > 0 && missing_count <= m {
@@ -1047,5 +1060,52 @@ mod tests {
         assert!(tracker.sources.contains_key(&0));
         // Index 1 with inconsistent base must be rejected from tracker.sources
         assert!(!tracker.sources.contains_key(&1));
+    }
+
+    #[test]
+    fn test_jitter_buffer_fec_parity_dimensions_clamped_and_wrap_safe() {
+        use crate::fec::FecHeader;
+
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+        let block_id = 999999;
+
+        // Malformed parity packet with massive k=65535, m=65535
+        let raw_hdr = FecHeader::new(FecScheme::ReedSolomon, block_id, 65535, 65535, 0, 100);
+        let mut buf = bytes::BytesMut::new();
+        raw_hdr.encode(&mut buf);
+        buf.extend_from_slice(b"fake-parity-payload");
+        let payload = buf.freeze();
+
+        let p_malformed = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 10, block_id, &payload),
+            payload,
+        );
+        jb.ingest_packet(p_malformed, now);
+
+        // Tracker should not have been created with illegal dimensions
+        assert!(!jb.fec_blocks.contains_key(&block_id));
+
+        // Wrap-safe test near u32::MAX
+        let wrap_block_id = 888888;
+        jb.register_fec_block(wrap_block_id, 2, 1);
+        let p_wrap0 = Packet::new(
+            PacketHeader::new(
+                PacketType::VideoFrameChunk,
+                0,
+                u32::MAX - 2,
+                wrap_block_id,
+                b"w0",
+            )
+            .with_flags(FLAG_FEC_PROTECTED)
+            .with_fec_index(0),
+            Bytes::from_static(b"w0"),
+        );
+        jb.ingest_packet(p_wrap0, now);
+
+        // Sequence u32::MAX - 1 is missing, base_seq is u32::MAX - 2.
+        // Must not panic with debug overflow arithmetic!
+        assert!(jb.is_sequence_fec_recoverable(u32::MAX - 1));
+        assert!(!jb.is_sequence_fec_recoverable(10));
     }
 }

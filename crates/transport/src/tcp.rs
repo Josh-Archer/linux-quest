@@ -71,7 +71,11 @@ impl TcpEndpoint {
                 ) == 0
                 {
                     // Linux doubles the requested socket buffer size for internal bookkeeping and returns the doubled value
+                    #[cfg(target_os = "linux")]
                     let granted_rcv = actual_rcv / 2;
+                    #[cfg(not(target_os = "linux"))]
+                    let granted_rcv = actual_rcv;
+
                     if granted_rcv < buf_size {
                         tracing::debug!(
                             "Kernel granted SO_RCVBUF of {} bytes (clamped from requested {} by net.core.rmem_max)",
@@ -92,7 +96,11 @@ impl TcpEndpoint {
                 ) == 0
                 {
                     // Linux doubles the requested socket buffer size for internal bookkeeping and returns the doubled value
+                    #[cfg(target_os = "linux")]
                     let granted_snd = actual_snd / 2;
+                    #[cfg(not(target_os = "linux"))]
+                    let granted_snd = actual_snd;
+
                     if granted_snd < buf_size {
                         tracing::debug!(
                             "Kernel granted SO_SNDBUF of {} bytes (clamped from requested {} by net.core.wmem_max)",
