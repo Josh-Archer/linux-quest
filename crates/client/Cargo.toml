@@ -23,6 +23,7 @@ tracing-subscriber.workspace = true
 parking_lot.workspace = true
 crc32fast.workspace = true
 serde = { workspace = true, features = ["derive"] }
+libc.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media", "nativewindow", "sync", "api-level-30"] }

@@ -82,6 +82,11 @@ pub fn android_main(app: AndroidApp) {
                                         &mut header_slice,
                                     ) {
                                         Ok(header) => {
+                                            // Reject unreasonable packet payload lengths (> 1MB) to prevent unbounded memory growth
+                                            if header.payload_len > 1_048_576 {
+                                                read_buf.remove(0);
+                                                continue;
+                                            }
                                             let total_size =
                                                 linux_quest_protocol::packet::HEADER_SIZE
                                                     + header.payload_len as usize;

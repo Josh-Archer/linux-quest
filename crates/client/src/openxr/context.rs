@@ -40,6 +40,7 @@ pub struct OpenXrContext {
     desktop_swapchain_is_surface: bool,
     supports_layer_settings: bool,
     should_exit: Arc<AtomicBool>,
+    timespec_converter: Option<openxr::raw::ConvertTimespecTimeKHR>,
     is_simulated: bool,
 }
 
@@ -69,6 +70,7 @@ impl OpenXrContext {
             desktop_swapchain_is_surface: false,
             supports_layer_settings: false,
             should_exit: Arc::new(AtomicBool::new(false)),
+            timespec_converter: None,
             is_simulated: true,
         }
     }
@@ -120,13 +122,39 @@ impl OpenXrContext {
             required_exts.fb_composition_layer_settings = true;
         }
 
+        if available_exts.khr_convert_timespec_time {
+            required_exts.khr_convert_timespec_time = true;
+        }
+
         #[cfg(target_os = "android")]
         {
+            if !config.force_mock_decoder {
+                if !available_exts.khr_convert_timespec_time {
+                    return Err(ClientError::OpenXr(
+                        "XR_KHR_convert_timespec_time is required on Meta Horizon OS".into(),
+                    ));
+                }
+                if !available_exts.khr_android_surface_swapchain {
+                    return Err(ClientError::OpenXr(
+                        "XR_KHR_android_surface_swapchain is required on Meta Horizon OS".into(),
+                    ));
+                }
+                if !available_exts.fb_android_surface_swapchain_create {
+                    return Err(ClientError::OpenXr(
+                        "XR_FB_android_surface_swapchain_create is required on Meta Horizon OS"
+                            .into(),
+                    ));
+                }
+            }
+
             if available_exts.khr_android_create_instance {
                 required_exts.khr_android_create_instance = true;
             }
             if available_exts.khr_android_surface_swapchain {
                 required_exts.khr_android_surface_swapchain = true;
+            }
+            if available_exts.fb_android_surface_swapchain_create {
+                required_exts.fb_android_surface_swapchain_create = true;
             }
         }
 
@@ -141,6 +169,22 @@ impl OpenXrContext {
         let instance = entry
             .create_instance(&app_info, &required_exts, &[], &platform_info)
             .map_err(|e| ClientError::OpenXr(format!("Failed to create OpenXR instance: {e:?}")))?;
+
+        let timespec_converter = if available_exts.khr_convert_timespec_time {
+            let loaded = unsafe {
+                openxr::raw::ConvertTimespecTimeKHR::load(&entry, instance.as_raw()).ok()
+            };
+            #[cfg(target_os = "android")]
+            if !config.force_mock_decoder && loaded.is_none() {
+                return Err(ClientError::OpenXr(
+                    "Failed to load ConvertTimespecTimeKHR function pointers on Meta Horizon OS"
+                        .into(),
+                ));
+            }
+            loaded
+        } else {
+            None
+        };
 
         let system = instance
             .system(FormFactor::HEAD_MOUNTED_DISPLAY)
@@ -305,6 +349,19 @@ impl OpenXrContext {
             ))
         };
 
+        // Enumerate swapchain formats supported by OpenXR runtime
+        let supported_formats = session.enumerate_swapchain_formats().unwrap_or_default();
+        let swapchain_format =
+            if supported_formats.contains(&(vk::Format::R8G8B8A8_UNORM.as_raw() as u32)) {
+                vk::Format::R8G8B8A8_UNORM.as_raw() as u32
+            } else if supported_formats.contains(&(vk::Format::R8G8B8A8_SRGB.as_raw() as u32)) {
+                vk::Format::R8G8B8A8_SRGB.as_raw() as u32
+            } else if let Some(&first) = supported_formats.first() {
+                first
+            } else {
+                vk::Format::R8G8B8A8_UNORM.as_raw() as u32
+            };
+
         // Create initial swapchains
         #[cfg(target_os = "android")]
         let (desktop_swapchain, surface_window, desktop_swapchain_is_surface) = if available_exts
@@ -319,13 +376,22 @@ impl OpenXrContext {
                     },
                 )?
             };
+            let fb_surface_create_info = openxr::sys::AndroidSurfaceSwapchainCreateInfoFB {
+                ty: openxr::sys::StructureType::ANDROID_SURFACE_SWAPCHAIN_CREATE_INFO_FB,
+                next: std::ptr::null(),
+                create_flags: openxr::sys::AndroidSurfaceSwapchainFlagsFB::USE_TIMESTAMPS,
+            };
             let info = openxr::sys::SwapchainCreateInfo {
                 ty: openxr::sys::StructureType::SWAPCHAIN_CREATE_INFO,
-                next: std::ptr::null(),
+                next: if available_exts.fb_android_surface_swapchain_create {
+                    &fb_surface_create_info as *const _ as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                },
                 create_flags: openxr::sys::SwapchainCreateFlags::EMPTY,
                 usage_flags: openxr::sys::SwapchainUsageFlags::COLOR_ATTACHMENT
                     | openxr::sys::SwapchainUsageFlags::SAMPLED,
-                format: vk::Format::R8G8B8A8_UNORM.as_raw() as i64,
+                format: swapchain_format as i64,
                 sample_count: 1,
                 width: config.stream_width,
                 height: config.stream_height,
@@ -349,17 +415,20 @@ impl OpenXrContext {
                     res.into_raw()
                 )));
             }
+            let sc =
+                unsafe { openxr::Swapchain::<Vulkan>::from_raw(session.clone(), raw_swapchain) };
             let native_window = if !surface.is_null() {
                 let ctx = ndk_context::android_context();
                 let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }
                     .map_err(|e| ClientError::OpenXr(format!("JNI JavaVM error: {e:?}")))?;
-                let env_raw = match vm.get_env() {
-                    Ok(env) => env.get_raw(),
+                let (_guard, env_raw) = match vm.get_env() {
+                    Ok(env) => (None, env.get_raw()),
                     Err(_) => {
                         let guard = vm.attach_current_thread().map_err(|e| {
                             ClientError::OpenXr(format!("JNI attach thread failed: {e:?}"))
                         })?;
-                        guard.get_raw()
+                        let raw = guard.get_raw();
+                        (Some(guard), raw)
                     }
                 };
                 let win = unsafe { ndk_sys::ANativeWindow_fromSurface(env_raw as _, surface as _) };
@@ -371,16 +440,21 @@ impl OpenXrContext {
                 std::ptr::NonNull::new(win)
                     .map(|ptr| unsafe { ndk::native_window::NativeWindow::from_ptr(ptr) })
             } else {
-                None
+                return Err(ClientError::OpenXr(
+                    "xrCreateSwapchainAndroidSurfaceKHR returned a null surface jobject".into(),
+                ));
             };
-            let sc =
-                unsafe { openxr::Swapchain::<Vulkan>::from_raw(session.clone(), raw_swapchain) };
             (Some(sc), native_window, true)
         } else {
+            if !config.force_mock_decoder {
+                return Err(ClientError::OpenXr(
+                    "XR_KHR_android_surface_swapchain is required on Meta Horizon OS".into(),
+                ));
+            }
             let desktop_info = SwapchainCreateInfo {
                 create_flags: SwapchainCreateFlags::EMPTY,
                 usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,
-                format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
+                format: swapchain_format,
                 sample_count: 1,
                 width: config.stream_width,
                 height: config.stream_height,
@@ -399,7 +473,7 @@ impl OpenXrContext {
             let desktop_info = SwapchainCreateInfo {
                 create_flags: SwapchainCreateFlags::EMPTY,
                 usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,
-                format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
+                format: swapchain_format,
                 sample_count: 1,
                 width: config.stream_width,
                 height: config.stream_height,
@@ -418,7 +492,7 @@ impl OpenXrContext {
             usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT
                 | SwapchainUsageFlags::SAMPLED
                 | SwapchainUsageFlags::TRANSFER_DST,
-            format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
+            format: swapchain_format,
             sample_count: 1,
             width: 512,
             height: 256,
@@ -459,6 +533,7 @@ impl OpenXrContext {
             desktop_swapchain_is_surface,
             supports_layer_settings: available_exts.fb_composition_layer_settings,
             should_exit: Arc::new(AtomicBool::new(false)),
+            timespec_converter,
             is_simulated: false,
         })
     }
@@ -507,6 +582,31 @@ impl OpenXrContext {
     /// Whether the OpenXR session has received an EXITING or LOSS_PENDING event.
     pub fn should_exit(&self) -> bool {
         self.should_exit.load(Ordering::SeqCst)
+    }
+
+    /// Converts an OpenXR predicted presentation time (`XrTime`) to a `CLOCK_MONOTONIC` timestamp in nanoseconds.
+    pub fn convert_time_to_monotonic_ns(&self, time: openxr::Time) -> i64 {
+        if let (Some(ext), Some(instance)) = (&self.timespec_converter, &self.instance) {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let res =
+                unsafe { (ext.convert_time_to_timespec_time)(instance.as_raw(), time, &mut ts) };
+            if res.into_raw() >= 0 {
+                return ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
+            }
+        }
+
+        // Fallback for simulation mode or when XR_KHR_convert_timespec_time is unavailable
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+        }
+        now.tv_sec * 1_000_000_000 + now.tv_nsec
     }
 
     /// Returns the active refresh rate manager.
@@ -745,6 +845,48 @@ impl OpenXrContext {
                     | openxr::sys::CompositionLayerSettingsFlagsFB::QUALITY_SHARPENING,
             };
 
+            let mut hud_layer_ready = false;
+            if config.enable_hud && self.view_space.is_some() {
+                if let Some(hud_sc) = &mut self.hud_swapchain {
+                    if let Ok(idx) = hud_sc.acquire_image() {
+                        let wait_res = hud_sc.wait_image(openxr::Duration::INFINITE);
+                        let mut upload_ok = false;
+                        if wait_res.is_ok() {
+                            if let Some(rgba) = hud_rgba {
+                                if let Some(&img) = self.hud_images.get(idx as usize) {
+                                    if let Err(e) =
+                                        vulkan_context.upload_rgba_to_image(img, 512, 256, rgba)
+                                    {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "Failed to upload HUD RGBA texture to OpenXR swapchain image"
+                                        );
+                                    } else {
+                                        upload_ok = true;
+                                    }
+                                }
+                            }
+                        }
+                        // Always release acquired image, even if wait or upload failed
+                        let rel_res = hud_sc.release_image();
+                        if wait_res.is_ok() && upload_ok && rel_res.is_ok() {
+                            hud_layer_ready = true;
+                        }
+                    }
+                }
+            }
+
+            let hud_layer = if hud_layer_ready {
+                Some(crate::openxr::layers::build_hud_layer(
+                    self.view_space.as_ref().unwrap(),
+                    self.hud_swapchain.as_ref().unwrap(),
+                    512,
+                    256,
+                ))
+            } else {
+                None
+            };
+
             if self.supports_cylinder
                 && config.display_mode == crate::config::DisplayMode::CurvedCylinder
             {
@@ -763,35 +905,14 @@ impl OpenXrContext {
                     cyl_layer
                 };
 
-                if config.enable_hud {
-                    if let (Some(view_space), Some(hud_sc)) =
-                        (&self.view_space, &mut self.hud_swapchain)
-                    {
-                        if let Ok(idx) = hud_sc.acquire_image() {
-                            if hud_sc.wait_image(openxr::Duration::INFINITE).is_ok() {
-                                if let Some(rgba) = hud_rgba {
-                                    if let Some(&img) = self.hud_images.get(idx as usize) {
-                                        let _ = vulkan_context
-                                            .upload_rgba_to_image(img, 512, 256, rgba);
-                                    }
-                                }
-                                let _ = hud_sc.release_image();
-                            }
-                        }
-                        let hud_layer =
-                            crate::openxr::layers::build_hud_layer(view_space, hud_sc, 512, 256);
-                        stream
-                            .end(
-                                display_time,
-                                EnvironmentBlendMode::OPAQUE,
-                                &[&cyl_layer, &hud_layer],
-                            )
-                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
-                    } else {
-                        stream
-                            .end(display_time, EnvironmentBlendMode::OPAQUE, &[&cyl_layer])
-                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
-                    }
+                if let Some(hud) = &hud_layer {
+                    stream
+                        .end(
+                            display_time,
+                            EnvironmentBlendMode::OPAQUE,
+                            &[&cyl_layer, hud],
+                        )
+                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                 } else {
                     stream
                         .end(display_time, EnvironmentBlendMode::OPAQUE, &[&cyl_layer])
@@ -813,35 +934,14 @@ impl OpenXrContext {
                     quad_layer
                 };
 
-                if config.enable_hud {
-                    if let (Some(view_space), Some(hud_sc)) =
-                        (&self.view_space, &mut self.hud_swapchain)
-                    {
-                        if let Ok(idx) = hud_sc.acquire_image() {
-                            if hud_sc.wait_image(openxr::Duration::INFINITE).is_ok() {
-                                if let Some(rgba) = hud_rgba {
-                                    if let Some(&img) = self.hud_images.get(idx as usize) {
-                                        let _ = vulkan_context
-                                            .upload_rgba_to_image(img, 512, 256, rgba);
-                                    }
-                                }
-                                let _ = hud_sc.release_image();
-                            }
-                        }
-                        let hud_layer =
-                            crate::openxr::layers::build_hud_layer(view_space, hud_sc, 512, 256);
-                        stream
-                            .end(
-                                display_time,
-                                EnvironmentBlendMode::OPAQUE,
-                                &[&quad_layer, &hud_layer],
-                            )
-                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
-                    } else {
-                        stream
-                            .end(display_time, EnvironmentBlendMode::OPAQUE, &[&quad_layer])
-                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
-                    }
+                if let Some(hud) = &hud_layer {
+                    stream
+                        .end(
+                            display_time,
+                            EnvironmentBlendMode::OPAQUE,
+                            &[&quad_layer, hud],
+                        )
+                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                 } else {
                     stream
                         .end(display_time, EnvironmentBlendMode::OPAQUE, &[&quad_layer])

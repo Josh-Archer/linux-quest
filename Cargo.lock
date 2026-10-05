@@ -309,6 +309,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "jni 0.21.1",
+ "libc",
  "linux-quest-protocol",
  "linux-quest-transport",
  "ndk",

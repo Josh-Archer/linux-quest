@@ -94,6 +94,9 @@ impl QuestClientRuntime {
         // 2. Pace rendering loop to target headset refresh rate (72Hz, 90Hz, 120Hz)
         let pacing = self.frame_loop.wait_frame_pacing(&self.openxr_context)?;
         let display_time = openxr::Time::from_nanos(pacing.predicted_display_time);
+        let monotonic_display_ns = self
+            .openxr_context
+            .convert_time_to_monotonic_ns(display_time);
 
         // If OpenXR requests not to render (should_render == false), end frame with empty layers
         if !pacing.should_render {
@@ -125,10 +128,17 @@ impl QuestClientRuntime {
         }
 
         // 4. Dequeue and release hardware-decoded video frames direct to OpenXR surface
+        let mut latest_frame = None;
         while let Ok(Some(frame)) = self.decoder.dequeue_output_buffer(0) {
+            if let Some(prev) = latest_frame.replace(frame) {
+                // Drop older frame without rendering to prevent backlog and multiple frames stamped at same display time
+                let _ = self.decoder.release_output_buffer(prev.buffer_index, false);
+            }
+        }
+        if let Some(frame) = latest_frame {
             let _ = self
                 .decoder
-                .release_output_buffer_at_time(frame.buffer_index, pacing.predicted_display_time);
+                .release_output_buffer_at_time(frame.buffer_index, monotonic_display_ns);
         }
 
         // 5. Update debug HUD telemetry
@@ -157,8 +167,7 @@ impl QuestClientRuntime {
         );
 
         if let Err(e) = present_res {
-            tracing::warn!(error = ?e, "Layer presentation failed; submitting empty frame");
-            let _ = self.openxr_context.end_frame_empty(display_time);
+            tracing::warn!(error = ?e, "Layer presentation failed");
             return Err(e);
         }
 

@@ -466,8 +466,8 @@ impl VulkanContext {
 
             if let Err(e) = device.end_command_buffer(cmd) {
                 device.free_command_buffers(self.command_pool, &[cmd]);
-                device.free_memory(staging_memory, None);
                 device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
                 return Err(ClientError::Vulkan(format!("End cmd buffer failed: {e:?}")));
             }
 
@@ -476,8 +476,8 @@ impl VulkanContext {
                 Ok(f) => f,
                 Err(e) => {
                     device.free_command_buffers(self.command_pool, &[cmd]);
-                    device.free_memory(staging_memory, None);
                     device.destroy_buffer(staging_buffer, None);
+                    device.free_memory(staging_memory, None);
                     return Err(ClientError::Vulkan(format!("Create fence failed: {e:?}")));
                 }
             };
@@ -489,16 +489,34 @@ impl VulkanContext {
             if let Err(e) = submit_res {
                 device.destroy_fence(fence, None);
                 device.free_command_buffers(self.command_pool, &[cmd]);
-                device.free_memory(staging_memory, None);
                 device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
                 return Err(ClientError::Vulkan(format!("Queue submit failed: {e:?}")));
             }
 
-            let _ = device.wait_for_fences(&[fence], true, 1_000_000_000);
+            let wait_res = device.wait_for_fences(&[fence], true, 1_000_000_000);
+            if let Err(e) = wait_res {
+                // If fence wait timed out or failed, wait for device idle before cleanup.
+                // If device_wait_idle fails (device lost), do NOT destroy in-flight objects
+                // to avoid GPU-timeline UAF and Vulkan VUID validation errors.
+                if let Err(idle_err) = device.device_wait_idle() {
+                    return Err(ClientError::Vulkan(format!(
+                        "Wait for staging fence failed ({e:?}) and device_wait_idle failed ({idle_err:?})"
+                    )));
+                }
+                device.destroy_fence(fence, None);
+                device.free_command_buffers(self.command_pool, &[cmd]);
+                device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
+                return Err(ClientError::Vulkan(format!(
+                    "Wait for staging copy fence failed: {e:?}"
+                )));
+            }
+
             device.destroy_fence(fence, None);
             device.free_command_buffers(self.command_pool, &[cmd]);
-            device.free_memory(staging_memory, None);
             device.destroy_buffer(staging_buffer, None);
+            device.free_memory(staging_memory, None);
         }
 
         Ok(())
