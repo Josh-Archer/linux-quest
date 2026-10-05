@@ -155,6 +155,9 @@ impl ReedSolomonFec {
             return Err(FecError::InvalidConfiguration { k, m });
         }
 
+        // Discard any extraneous indices >= k
+        received_sources.retain(|&idx, _| idx < k);
+
         // Fast path: all K source packets already received
         if received_sources.len() == k {
             let mut result = Vec::with_capacity(k);

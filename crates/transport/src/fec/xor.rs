@@ -58,6 +58,9 @@ impl XorFec {
             return Err(FecError::InvalidConfiguration { k, m: 1 });
         }
 
+        // Discard any extraneous indices >= k
+        received_sources.retain(|&idx, _| idx < k);
+
         if received_sources.len() == k {
             let mut result = Vec::with_capacity(k);
             for i in 0..k {

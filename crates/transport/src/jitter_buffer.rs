@@ -489,10 +489,7 @@ impl AdaptiveJitterBuffer {
                         let recovered_packet = Packet::new(rec_header, payload);
                         e.insert((seq, recovered_packet.clone()));
 
-                        // Discard recovered packets older than playout cursor.
-                        // Late recovery behind expected playout cursor must not be inserted into the queue,
-                        // must not increment packets_reconstructed_fec, and must not trigger queue capping
-                        // which would evict valid future packets from the tail.
+                        // Discard reconstructed packets if playout has already advanced past them.
                         let is_stale = match self.expected_unwrapped {
                             Some(expected) => unwrapped_seq < expected,
                             None => false,
@@ -521,18 +518,19 @@ impl AdaptiveJitterBuffer {
                 }
 
                 // Cap queue depth while preserving reconstructed packets.
-                // If recovered packet landed at or past the queue maximum, evict stale packets from the front.
-                // Otherwise, drop premature future packets from the tail.
+                // Drop premature future packets from the tail that arrived ahead of the reconstructed block.
+                // If queue depth still exceeds the limit, evict stale packets from the front.
                 if let Some(rec_max) = max_rec_seq {
-                    if let Some(&queue_max) = self.queue.keys().next_back() {
-                        if rec_max < queue_max {
-                            while self.queue.len() > self.config.max_queue_depth {
+                    while self.queue.len() > self.config.max_queue_depth {
+                        if let Some(&tail_seq) = self.queue.keys().next_back() {
+                            if tail_seq > rec_max {
                                 self.queue.pop_last();
+                                continue;
                             }
-                        } else {
-                            self.evict_stale(self.config.max_queue_depth);
                         }
+                        break;
                     }
+                    self.evict_stale(self.config.max_queue_depth);
                 }
                 return true;
             }
@@ -2263,6 +2261,83 @@ mod tests {
         assert!(
             !jb.fec_blocks.contains_key(&block_id),
             "Incomplete expired FEC block should have been pruned"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_multi_packet_fec_recovery_preserves_all_recovered_packets() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_queue_depth: 2,
+            ..Default::default()
+        });
+
+        let now = Instant::now();
+        let block_id = 1000;
+        let p10_payload = Bytes::from_static(b"source-10");
+        let p11_payload = Bytes::from_static(b"source-11");
+        let p12_payload = Bytes::from_static(b"source-12");
+
+        // Reed-Solomon block with k=3, m=2
+        let parities = ReedSolomonFec::encode(
+            block_id,
+            &[
+                p10_payload.clone(),
+                p11_payload.clone(),
+                p12_payload.clone(),
+            ],
+            2,
+        )
+        .expect("FEC encode should succeed");
+
+        // Queue initially has source seq 10 and future seq 20 (max_queue_depth = 2)
+        let p10 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, &p10_payload)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            p10_payload,
+        );
+        let p20 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 20, 2000, b"p20"),
+            Bytes::from_static(b"p20"),
+        );
+        jb.register_fec_block(block_id, 3, 2);
+        jb.ingest_packet(p10, now);
+        jb.ingest_packet(p20, now);
+        assert_eq!(jb.queue_len(), 2);
+
+        // Ingest two parity packets for block 1000 (sequences 13 and 14), triggering recovery of 11 and 12
+        let p_par0 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 13, block_id, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+        let p_par1 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 14, block_id, &parities[1])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[1].clone(),
+        );
+        jb.ingest_packet(p_par0, now);
+        jb.ingest_packet(p_par1, now);
+
+        // Both source 11 and source 12 are recovered!
+        assert_eq!(jb.stats().packets_reconstructed_fec, 2);
+        // Queue capping must have dropped future packet 20 and evicted 10 from the front,
+        // leaving the queue with {11, 12} clamped to max_queue_depth 2.
+        assert_eq!(jb.queue_len(), 2);
+
+        // Playout pops packet 11, then packet 12!
+        let out11 = jb.pop_ready_packet(now).expect("Packet 11 must pop");
+        let out12 = jb.pop_ready_packet(now).expect("Packet 12 must pop");
+        assert_eq!(out11.header.sequence, 11);
+        assert_eq!(out12.header.sequence, 12);
+        assert_eq!(jb.stats().packets_delivered, 2);
+        // Recovered packet 12 must NOT have been lost!
+        assert_eq!(
+            jb.stats().packets_lost,
+            1,
+            "Only evicted packet 10 should be counted lost"
         );
     }
 }

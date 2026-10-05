@@ -232,8 +232,12 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                 }
 
                 if *attempts >= self.config.max_reconnect_attempts {
-                    // Max attempts exceeded, return to Idle
+                    // Max attempts exceeded, remove reverse port and return to Idle
                     let old_serial = serial.clone();
+                    let _ = self
+                        .runner
+                        .reverse_remove(Some(&old_serial), self.config.remote_port)
+                        .await;
                     self.state = AdbBridgeState::Idle;
                     let evt = AdbBridgeEvent::DeviceDisconnected(old_serial);
                     let _ = self.event_sender.send(evt.clone());
