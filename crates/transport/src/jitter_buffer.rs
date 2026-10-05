@@ -59,6 +59,9 @@ struct FecBlockTracker {
     parities: Vec<(usize, Bytes)>,          // (parity_index, raw_bytes)
 }
 
+/// Maximum number of active FEC blocks tracked simultaneously in memory.
+pub const MAX_FEC_BLOCKS: usize = 64;
+
 /// Dynamic, adaptive jitter buffer with RFC 3550 jitter calculation and integrated FEC recovery.
 pub struct AdaptiveJitterBuffer {
     config: JitterBufferConfig,
@@ -149,6 +152,14 @@ impl AdaptiveJitterBuffer {
         if packet.header.packet_type == PacketType::FecParity {
             let mut slice = &packet.payload[..];
             if let Ok(fec_header) = FecHeader::decode(&mut slice) {
+                if !self.fec_blocks.contains_key(&fec_header.block_id)
+                    && self.fec_blocks.len() >= MAX_FEC_BLOCKS
+                {
+                    if let Some(&oldest) = self.fec_blocks.keys().min() {
+                        self.fec_blocks.remove(&oldest);
+                    }
+                }
+
                 let tracker = self
                     .fec_blocks
                     .entry(fec_header.block_id)
@@ -161,10 +172,13 @@ impl AdaptiveJitterBuffer {
                     });
 
                 tracker.scheme = fec_header.scheme;
-                tracker
-                    .parities
-                    .push((fec_header.parity_index as usize, packet.payload.clone()));
-                self.try_fec_recovery(fec_header.block_id, now);
+                tracker.k = fec_header.source_count as usize;
+                tracker.m = fec_header.parity_count as usize;
+                let p_idx = fec_header.parity_index as usize;
+                if tracker.m > 0 && p_idx < tracker.m {
+                    tracker.parities.push((p_idx, packet.payload.clone()));
+                    self.try_fec_recovery(fec_header.block_id, now);
+                }
             }
             return;
         }
@@ -172,6 +186,12 @@ impl AdaptiveJitterBuffer {
         // Check if packet belongs to an FEC protected block
         if (packet.header.flags & FLAG_FEC_PROTECTED) != 0 {
             let block_id = packet.header.timestamp_us; // Group by frame/block timestamp
+            if !self.fec_blocks.contains_key(&block_id) && self.fec_blocks.len() >= MAX_FEC_BLOCKS {
+                if let Some(&oldest) = self.fec_blocks.keys().min() {
+                    self.fec_blocks.remove(&oldest);
+                }
+            }
+
             let tracker = self
                 .fec_blocks
                 .entry(block_id)
@@ -184,8 +204,10 @@ impl AdaptiveJitterBuffer {
                 });
 
             let idx = packet.header.fec_index() as usize;
-            tracker.sources.insert(idx, (seq, packet.clone()));
-            self.try_fec_recovery(block_id, now);
+            if tracker.k == 0 || idx < tracker.k {
+                tracker.sources.insert(idx, (seq, packet.clone()));
+                self.try_fec_recovery(block_id, now);
+            }
         }
 
         self.queue.insert(
@@ -236,7 +258,12 @@ impl AdaptiveJitterBuffer {
         let m = tracker.m;
         let available = tracker.sources.len() + tracker.parities.len();
 
-        if tracker.sources.len() == k || available < k {
+        if tracker.sources.len() == k {
+            self.fec_blocks.remove(&block_id);
+            return false;
+        }
+
+        if available < k {
             return false;
         }
 
@@ -273,6 +300,7 @@ impl AdaptiveJitterBuffer {
                         rec_header.sequence = base_seq.saturating_add(idx as u32);
                         rec_header = rec_header.with_fec_index(idx as u16);
                         rec_header.payload_len = payload.len() as u32;
+                        rec_header.checksum = crc32fast::hash(&payload);
 
                         let recovered_packet = Packet::new(rec_header, payload);
                         self.queue.insert(
@@ -286,6 +314,7 @@ impl AdaptiveJitterBuffer {
                         self.stats.packets_reconstructed_fec += 1;
                     }
                 }
+                self.fec_blocks.remove(&block_id);
                 return true;
             }
         }
@@ -309,8 +338,10 @@ impl AdaptiveJitterBuffer {
             if let Some(expected) = self.expected_sequence {
                 if seq > expected {
                     self.stats.packets_lost += (seq - expected) as u64;
+                    self.expected_sequence = Some(seq + 1);
+                } else if seq == expected {
+                    self.expected_sequence = Some(seq + 1);
                 }
-                self.expected_sequence = Some(seq + 1);
             }
 
             self.stats.packets_delivered += 1;
@@ -401,7 +432,7 @@ mod tests {
 
         jb.register_fec_block(block_id, 3, 1);
 
-        // Ingest s0 and s2 (s1 dropped!), plus parity 0
+        // Ingest s0 and s2 (s1 dropped), plus parity 0
         let p0 = Packet::new(
             PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, &s0)
                 .with_flags(FLAG_FEC_PROTECTED)

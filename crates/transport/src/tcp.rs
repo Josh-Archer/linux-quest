@@ -10,6 +10,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::{TransportEndpoint, TransportError, TransportMode, TransportStats};
 
+/// Maximum payload length allowed over TCP transport (16MB).
+pub const MAX_TCP_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+
 /// High-throughput, ultra-low-latency TCP streaming endpoint optimized for USB ADB reverse-tethering.
 /// Configured with TCP_NODELAY and tuned socket buffers to sustain 200-250 Mbps with sub-0.5ms jitter.
 pub struct TcpEndpoint {
@@ -22,6 +25,30 @@ pub struct TcpEndpoint {
 impl TcpEndpoint {
     pub fn new(stream: TcpStream) -> Result<Self, TransportError> {
         stream.set_nodelay(true)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = stream.as_raw_fd();
+            let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB socket buffers
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+            }
+        }
+
         let peer_addr = stream.peer_addr().ok();
         let (reader, writer) = stream.into_split();
 
@@ -102,6 +129,14 @@ impl TransportEndpoint for TcpEndpoint {
         let header = PacketHeader::decode(&mut slice)?;
 
         let payload_len = header.payload_len as usize;
+        if payload_len > MAX_TCP_PAYLOAD_SIZE {
+            return Err(TransportError::Protocol(
+                linux_quest_protocol::ProtocolError::PayloadLengthMismatch {
+                    expected: MAX_TCP_PAYLOAD_SIZE,
+                    actual: payload_len,
+                },
+            ));
+        }
         let mut payload_buf = vec![0u8; payload_len];
 
         if payload_len > 0 {

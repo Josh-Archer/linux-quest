@@ -110,19 +110,26 @@ impl TransportEndpoint for PacedUdpEndpoint {
 
     async fn recv_packet(&mut self) -> Result<Packet, TransportError> {
         let mut buf = vec![0u8; 65535];
-        let (len, sender_addr) = self.socket.recv_from(&mut buf).await?;
+        loop {
+            let (len, sender_addr) = self.socket.recv_from(&mut buf).await?;
 
-        if self.remote_addr.is_none() {
-            self.remote_addr = Some(sender_addr);
+            if let Some(expected) = self.remote_addr {
+                if sender_addr != expected {
+                    // Drop datagrams from unexpected sources
+                    continue;
+                }
+            } else {
+                self.remote_addr = Some(sender_addr);
+            }
+
+            let packet = Packet::from_bytes(&buf[..len])?;
+
+            self.stats.packets_recv.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .bytes_recv
+                .fetch_add(len as u64, Ordering::Relaxed);
+            return Ok(packet);
         }
-
-        let packet = Packet::from_bytes(&buf[..len])?;
-
-        self.stats.packets_recv.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .bytes_recv
-            .fetch_add(len as u64, Ordering::Relaxed);
-        Ok(packet)
     }
 
     fn mode(&self) -> TransportMode {

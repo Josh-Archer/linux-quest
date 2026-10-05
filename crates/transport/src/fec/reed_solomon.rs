@@ -42,12 +42,12 @@ impl GaloisField {
     }
 
     #[inline(always)]
-    fn inv(&self, a: u8) -> u8 {
+    fn inv(&self, a: u8) -> Result<u8, FecError> {
         if a == 0 {
-            panic!("GF(2^8) inversion of zero");
+            return Err(FecError::SingularMatrix);
         }
         let log_a = self.log[a as usize] as usize;
-        self.exp[255 - log_a]
+        Ok(self.exp[255 - log_a])
     }
 }
 
@@ -62,10 +62,19 @@ impl ReedSolomonFec {
     /// Y_j = j for j in 0..k
     /// X_i = k + i for i in 0..m
     #[inline(always)]
-    fn cauchy_coeff(k: usize, parity_idx: usize, source_idx: usize) -> u8 {
+    fn cauchy_coeff(
+        k: usize,
+        m: usize,
+        parity_idx: usize,
+        source_idx: usize,
+    ) -> Result<u8, FecError> {
+        if source_idx >= k || parity_idx >= m {
+            return Err(FecError::CorruptHeader);
+        }
         let x = (k + parity_idx) as u8;
         let y = source_idx as u8;
-        GF.inv(x ^ y)
+        let diff = x ^ y;
+        GF.inv(diff)
     }
 
     /// Encodes K source packets into M parity packets.
@@ -103,7 +112,7 @@ impl ReedSolomonFec {
             let mut parity_symbol = vec![0u8; symbol_size];
 
             for s_idx in 0..k {
-                let coeff = Self::cauchy_coeff(k, p_idx, s_idx);
+                let coeff = Self::cauchy_coeff(k, m, p_idx, s_idx)?;
                 let src = &source_symbols[s_idx];
                 for b_idx in 0..symbol_size {
                     parity_symbol[b_idx] ^= GF.mul(coeff, src[b_idx]);
@@ -178,19 +187,29 @@ impl ReedSolomonFec {
         let mut symbol_size = 0;
 
         for (p_idx, raw_pkt) in received_parities.iter().take(num_missing) {
+            if *p_idx >= m {
+                return Err(FecError::CorruptHeader);
+            }
             let mut slice = &raw_pkt[..];
             let header = FecHeader::decode(&mut slice)?;
 
             if header.block_id != block_id
                 || header.source_count as usize != k
                 || header.parity_count as usize != m
+                || header.parity_index as usize != *p_idx
                 || header.scheme != super::FecScheme::ReedSolomon
             {
                 return Err(FecError::CorruptHeader);
             }
 
-            symbol_size = header.symbol_size as usize;
-            if slice.len() < symbol_size {
+            let p_symbol_size = header.symbol_size as usize;
+            if p_symbol_size < 2 || slice.len() < p_symbol_size {
+                return Err(FecError::CorruptHeader);
+            }
+
+            if symbol_size == 0 {
+                symbol_size = p_symbol_size;
+            } else if symbol_size != p_symbol_size {
                 return Err(FecError::CorruptHeader);
             }
 
@@ -201,6 +220,9 @@ impl ReedSolomonFec {
         let mut known_symbols: HashMap<usize, Vec<u8>> =
             HashMap::with_capacity(received_sources.len());
         for (&idx, packet) in &received_sources {
+            if idx >= k || packet.len() + 2 > symbol_size {
+                return Err(FecError::CorruptHeader);
+            }
             let mut sym = vec![0u8; symbol_size];
             let len = packet.len() as u16;
             let len_bytes = len.to_be_bytes();
@@ -223,7 +245,7 @@ impl ReedSolomonFec {
             r[row].copy_from_slice(p_symbol);
 
             for (&s_idx, s_symbol) in &known_symbols {
-                let coeff = Self::cauchy_coeff(k, p_idx, s_idx);
+                let coeff = Self::cauchy_coeff(k, m, p_idx, s_idx)?;
                 for b in 0..symbol_size {
                     r[row][b] ^= GF.mul(coeff, s_symbol[b]);
                 }
@@ -232,7 +254,7 @@ impl ReedSolomonFec {
             // Fill row of matrix A: A[row][col] = C[p_idx, missing_sources[col]]
             for col in 0..num_missing {
                 let s_missing_idx = missing_sources[col];
-                a[row][col] = Self::cauchy_coeff(k, p_idx, s_missing_idx);
+                a[row][col] = Self::cauchy_coeff(k, m, p_idx, s_missing_idx)?;
             }
         }
 
@@ -253,7 +275,7 @@ impl ReedSolomonFec {
                 r.swap(i, pivot_row);
             }
 
-            let pivot_inv = GF.inv(a[i][i]);
+            let pivot_inv = GF.inv(a[i][i])?;
             for col in 0..num_missing {
                 a[i][col] = GF.mul(a[i][col], pivot_inv);
             }
@@ -319,9 +341,10 @@ mod tests {
         assert_eq!(GF.mul(42, 1), 42);
 
         for a in 1..=255u8 {
-            let inv = GF.inv(a);
+            let inv = GF.inv(a).expect("inversion should succeed for non-zero");
             assert_eq!(GF.mul(a, inv), 1, "Failed for a={a}");
         }
+        assert!(matches!(GF.inv(0), Err(FecError::SingularMatrix)));
     }
 
     #[test]

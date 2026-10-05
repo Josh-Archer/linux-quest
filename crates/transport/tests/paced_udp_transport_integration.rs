@@ -91,6 +91,11 @@ async fn test_paced_udp_pacing_rate_limiting() {
     tokio::try_join!(sender, receiver).unwrap();
     let elapsed = start.elapsed();
 
-    // Must be positive and bounded (under 100ms for 10 packets)
+    // Must be rate-limited (at least 1ms) and bounded (under 100ms for 10 packets)
+    assert!(
+        elapsed.as_millis() >= 1,
+        "Pacing should take at least 1ms, got {:?}",
+        elapsed
+    );
     assert!(elapsed.as_millis() < 100);
 }

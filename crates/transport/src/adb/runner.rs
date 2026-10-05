@@ -5,7 +5,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
 
-use super::device::{parse_devices_output, parse_reverse_list_output, AdbDevice, AdbReverseRule};
+use super::device::{
+    parse_devices_output, parse_reverse_list_output, AdbDevice, AdbDeviceState, AdbReverseRule,
+};
 
 #[derive(Error, Debug)]
 pub enum AdbError {
@@ -70,12 +72,25 @@ impl SystemAdbRunner {
         }
         cmd
     }
+
+    async fn run_cmd(&self, mut cmd: Command) -> Result<std::process::Output, AdbError> {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(e)) => Err(AdbError::Io(e)),
+            Err(_) => Err(AdbError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ADB command timed out after 5 seconds",
+            ))),
+        }
+    }
 }
 
 #[async_trait]
 impl AdbCommandRunner for SystemAdbRunner {
     async fn list_devices(&self) -> Result<Vec<AdbDevice>, AdbError> {
-        let output = self.build_cmd(None, &["devices", "-l"]).output().await?;
+        let output = self
+            .run_cmd(self.build_cmd(None, &["devices", "-l"]))
+            .await?;
         if !output.status.success() {
             return Err(AdbError::CommandFailed {
                 cmd: format!("{} devices -l", self.adb_path),
@@ -96,8 +111,7 @@ impl AdbCommandRunner for SystemAdbRunner {
         let remote_arg = format!("tcp:{}", remote_port);
         let local_arg = format!("tcp:{}", local_port);
         let output = self
-            .build_cmd(serial, &["reverse", &remote_arg, &local_arg])
-            .output()
+            .run_cmd(self.build_cmd(serial, &["reverse", &remote_arg, &local_arg]))
             .await?;
 
         if !output.status.success() {
@@ -113,8 +127,7 @@ impl AdbCommandRunner for SystemAdbRunner {
     async fn reverse_remove(&self, serial: Option<&str>, remote_port: u16) -> Result<(), AdbError> {
         let remote_arg = format!("tcp:{}", remote_port);
         let output = self
-            .build_cmd(serial, &["reverse", "--remove", &remote_arg])
-            .output()
+            .run_cmd(self.build_cmd(serial, &["reverse", "--remove", &remote_arg]))
             .await?;
 
         if !output.status.success() {
@@ -129,8 +142,7 @@ impl AdbCommandRunner for SystemAdbRunner {
 
     async fn reverse_list(&self, serial: Option<&str>) -> Result<Vec<AdbReverseRule>, AdbError> {
         let output = self
-            .build_cmd(serial, &["reverse", "--list"])
-            .output()
+            .run_cmd(self.build_cmd(serial, &["reverse", "--list"]))
             .await?;
 
         if !output.status.success() {
@@ -148,9 +160,11 @@ impl AdbCommandRunner for SystemAdbRunner {
     async fn check_connection(&self, serial: Option<&str>) -> Result<bool, AdbError> {
         let devices = self.list_devices().await?;
         if let Some(target_serial) = serial {
-            Ok(devices.iter().any(|d| d.serial == target_serial))
+            Ok(devices
+                .iter()
+                .any(|d| d.serial == target_serial && d.state == AdbDeviceState::Device))
         } else {
-            Ok(!devices.is_empty())
+            Ok(devices.iter().any(|d| d.state == AdbDeviceState::Device))
         }
     }
 }
@@ -256,9 +270,15 @@ impl AdbCommandRunner for MockAdbRunner {
     async fn check_connection(&self, serial: Option<&str>) -> Result<bool, AdbError> {
         let state = self.state.lock();
         if let Some(target_serial) = serial {
-            Ok(state.devices.iter().any(|d| d.serial == target_serial))
+            Ok(state
+                .devices
+                .iter()
+                .any(|d| d.serial == target_serial && d.state == AdbDeviceState::Device))
         } else {
-            Ok(!state.devices.is_empty())
+            Ok(state
+                .devices
+                .iter()
+                .any(|d| d.state == AdbDeviceState::Device))
         }
     }
 }

@@ -39,16 +39,25 @@ impl PacketPacer {
 
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_send_time);
-        let elapsed_nanos = elapsed.as_nanos() as u64;
 
-        // Drain accumulated tokens according to elapsed time
-        let bytes_budget = (elapsed_nanos * self.rate_bytes_per_sec) / 1_000_000_000;
-        self.accumulated_bytes = self.accumulated_bytes.saturating_sub(bytes_budget as usize);
+        // Reset on large gaps (> 1 second) to prevent token arithmetic overflow and ensure freshness
+        if elapsed > Duration::from_secs(1) {
+            self.accumulated_bytes = 0;
+            self.last_send_time = now;
+        }
+
+        let elapsed_nanos = elapsed.as_nanos();
+
+        // Drain accumulated tokens according to elapsed time using u128 arithmetic
+        let bytes_budget =
+            ((elapsed_nanos * self.rate_bytes_per_sec as u128) / 1_000_000_000) as usize;
+        self.accumulated_bytes = self.accumulated_bytes.saturating_sub(bytes_budget);
         self.accumulated_bytes += packet_size_bytes;
 
         if self.accumulated_bytes > self.burst_allowance_bytes {
             let excess = self.accumulated_bytes - self.burst_allowance_bytes;
-            let delay_nanos = (excess as u64 * 1_000_000_000) / self.rate_bytes_per_sec;
+            let delay_nanos =
+                ((excess as u128 * 1_000_000_000) / self.rate_bytes_per_sec as u128) as u64;
             if delay_nanos > 0 {
                 tokio::time::sleep(Duration::from_nanos(delay_nanos)).await;
             }
@@ -85,7 +94,12 @@ mod tests {
 
         let elapsed = start.elapsed();
         // 14000 bytes at 50Mbps = 112,000 bits / 50,000,000 bps = 2.24ms.
-        // Sleep tolerance within 50ms.
+        // Sleep tolerance within 1ms to 50ms.
+        assert!(
+            elapsed.as_millis() >= 1,
+            "Pacing should take at least 1ms, got {:?}",
+            elapsed
+        );
         assert!(elapsed.as_millis() < 50);
     }
 }

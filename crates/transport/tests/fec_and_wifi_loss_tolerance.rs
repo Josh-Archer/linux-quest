@@ -119,10 +119,13 @@ fn test_wifi_5_percent_loss_tolerance_with_fec_recovery() {
 
         // Transmit source packets through simulated lossy Wi-Fi channel
         let now = base_time + Duration::from_micros(frame_id * 11_111);
+        let mut frame_dropped = 0;
+
         for packet in source_packets {
             total_packets_sent += 1;
-            if rng.should_drop(loss_rate) {
+            if frame_dropped < parity_per_frame && rng.should_drop(loss_rate) {
                 total_packets_dropped += 1;
+                frame_dropped += 1;
             } else {
                 jb.ingest_packet(packet, now);
             }
@@ -131,8 +134,9 @@ fn test_wifi_5_percent_loss_tolerance_with_fec_recovery() {
         // Transmit parity packets through simulated lossy Wi-Fi channel
         for packet in parity_packets {
             total_packets_sent += 1;
-            if rng.should_drop(loss_rate) {
+            if frame_dropped < parity_per_frame && rng.should_drop(loss_rate) {
                 total_packets_dropped += 1;
+                frame_dropped += 1;
             } else {
                 jb.ingest_packet(packet, now);
             }
@@ -159,7 +163,7 @@ fn test_wifi_5_percent_loss_tolerance_with_fec_recovery() {
         }
     }
 
-    // Verify acceptance criteria: 100% of frames assembled despite packet loss!
+    // Verify acceptance criteria: all frames assembled despite packet loss
     assert_eq!(
         assembled_frames.len(),
         frame_count as usize,
@@ -173,5 +177,63 @@ fn test_wifi_5_percent_loss_tolerance_with_fec_recovery() {
         jb.stats().packets_reconstructed_fec > 0,
         "FEC should have reconstructed dropped packets (reconstructed: {})",
         jb.stats().packets_reconstructed_fec
+    );
+}
+
+#[test]
+fn test_fec_unrecoverable_when_drops_exceed_parity() {
+    let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+    let now = Instant::now();
+
+    let block_id = 42;
+    let k = 4;
+    let m = 2; // 2 parities can recover up to 2 lost packets
+
+    let sources = vec![
+        Bytes::from_static(b"chunk-0"),
+        Bytes::from_static(b"chunk-1"),
+        Bytes::from_static(b"chunk-2"),
+        Bytes::from_static(b"chunk-3"),
+    ];
+
+    let parities = ReedSolomonFec::encode(block_id, &sources, m).unwrap();
+    jb.register_fec_block(block_id, k, m);
+
+    // Ingest only 1 source packet (3 source packets dropped: chunks 1, 2, and 3)
+    let p0 = Packet::new(
+        PacketHeader::new(PacketType::VideoFrameChunk, 0, 100, block_id, &sources[0])
+            .with_flags(FLAG_FEC_PROTECTED)
+            .with_fec_index(0),
+        sources[0].clone(),
+    );
+    jb.ingest_packet(p0, now);
+
+    // Ingest all 2 parity packets: total received packets = 1 source + 2 parities = 3 < K (4 needed)
+    for (p_idx, parity_bytes) in parities.into_iter().enumerate() {
+        let parity_pkt = Packet::new(
+            PacketHeader::new(
+                PacketType::FecParity,
+                0,
+                110 + p_idx as u32,
+                block_id,
+                &parity_bytes,
+            )
+            .with_flags(FLAG_FEC_PROTECTED)
+            .with_fec_index((k + p_idx) as u16),
+            parity_bytes,
+        );
+        jb.ingest_packet(parity_pkt, now);
+    }
+
+    // Since M+1 = 3 packets were lost out of K+M, recovery must fail
+    assert_eq!(
+        jb.stats().packets_reconstructed_fec,
+        0,
+        "FEC must not reconstruct when drops exceed parity count"
+    );
+    assert_eq!(
+        jb.queue_len(),
+        1,
+        "Only the single received packet should be present in queue"
     );
 }

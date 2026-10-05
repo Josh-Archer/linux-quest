@@ -44,6 +44,9 @@ pub enum ControlMessage {
     },
 }
 
+/// Maximum allowed size for a control signaling message (1MB).
+pub const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
+
 /// Out-of-band reliable signaling and control channel.
 /// Manages connection negotiation, display updates, adaptive bitrate feedback, and heartbeats.
 pub struct ControlChannel<R, W> {
@@ -84,6 +87,11 @@ where
             })?;
 
         let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_CONTROL_MESSAGE_SIZE {
+            return Err(ControlError::Deserialization(format!(
+                "Control message size {len} exceeds limit {MAX_CONTROL_MESSAGE_SIZE}"
+            )));
+        }
         let mut msg_buf = vec![0u8; len];
         self.reader
             .read_exact(&mut msg_buf)

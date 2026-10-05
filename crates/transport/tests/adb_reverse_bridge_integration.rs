@@ -99,7 +99,7 @@ async fn test_adb_reverse_bridge_lifecycle() {
 }
 
 #[tokio::test]
-async fn test_tcp_usb_reverse_high_throughput_and_sub_millisecond_jitter() {
+async fn test_tcp_endpoint_high_throughput_and_sub_millisecond_jitter() {
     let (mut client_ep, mut server_ep) = TcpEndpoint::create_connected_pair().await.unwrap();
     assert_eq!(client_ep.mode(), TransportMode::UsbAdb);
 
@@ -154,15 +154,19 @@ async fn test_tcp_usb_reverse_high_throughput_and_sub_millisecond_jitter() {
         (packet_count as u64) * (32 + chunk_size as u64)
     );
 
-    // Compute average inter-packet transit jitter over USB loopback
-    if !latencies_us.is_empty() {
-        let sum: f64 = latencies_us.iter().sum();
-        let avg_us = sum / latencies_us.len() as f64;
+    // Compute RFC 3550 inter-arrival transit jitter over TCP endpoint stream
+    if latencies_us.len() > 1 {
+        let mut jitter_us = 0.0f64;
+        for i in 1..latencies_us.len() {
+            let d = (latencies_us[i] - latencies_us[i - 1]).abs();
+            jitter_us += (d - jitter_us) / 16.0;
+        }
+
         // Verify sub-0.5ms (500us) transport jitter requirement
         assert!(
-            avg_us < 500.0,
-            "Average transport jitter {}us exceeds 500us sub-millisecond target",
-            avg_us
+            jitter_us < 500.0,
+            "TCP inter-arrival jitter {}us exceeds 500us sub-millisecond target",
+            jitter_us
         );
     }
 }

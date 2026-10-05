@@ -85,7 +85,7 @@ impl XorFec {
         }
 
         let symbol_size = header.symbol_size as usize;
-        if slice.len() < symbol_size {
+        if symbol_size < 2 || slice.len() < symbol_size {
             return Err(FecError::CorruptHeader);
         }
 
@@ -101,6 +101,9 @@ impl XorFec {
         let mut reconstructed_symbol = slice[..symbol_size].to_vec();
 
         for (&idx, packet) in &received_sources {
+            if idx >= k || packet.len() + 2 > symbol_size {
+                return Err(FecError::CorruptHeader);
+            }
             if idx == missing_idx {
                 continue;
             }

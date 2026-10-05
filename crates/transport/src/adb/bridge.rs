@@ -138,14 +138,16 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
             }
 
             AdbBridgeState::Connected { serial, .. } => {
-                let connected = self
-                    .runner
-                    .check_connection(Some(serial))
-                    .await
-                    .unwrap_or(false);
+                let connected = match self.runner.check_connection(Some(serial)).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("ADB check_connection error for {serial}: {e}");
+                        false
+                    }
+                };
 
                 if !connected {
-                    // Cable bumped or unplugged!
+                    // Device disconnected or connection check failed; begin reconnection
                     self.state = AdbBridgeState::Reconnecting {
                         serial: serial.clone(),
                         attempts: 1,
@@ -248,8 +250,14 @@ impl AdbBridgeHandle {
     }
 }
 
+impl Drop for AdbBridgeHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl<R: AdbCommandRunner + 'static> AdbBridge<R> {
-    /// Spawns a background monitor task with the configured poll interval.
+    /// Spawns a background monitor task with the configured poll interval and exponential backoff on reconnection.
     pub fn spawn_monitor(mut self) -> (AdbBridgeHandle, broadcast::Receiver<AdbBridgeEvent>) {
         let running = Arc::new(AtomicBool::new(true));
         let handle = AdbBridgeHandle {
@@ -257,11 +265,20 @@ impl<R: AdbCommandRunner + 'static> AdbBridge<R> {
         };
         let rx = self.subscribe();
 
-        let interval = self.config.poll_interval;
+        let base_interval = self.config.poll_interval;
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
-                let _ = self.poll_step().await;
-                tokio::time::sleep(interval).await;
+                if let Err(e) = self.poll_step().await {
+                    tracing::warn!("ADB monitor poll_step error: {e}");
+                }
+                let sleep_duration = match &self.state {
+                    AdbBridgeState::Reconnecting { attempts, .. } => {
+                        let shift = (*attempts).min(5) as u32;
+                        base_interval.saturating_mul(1 << shift)
+                    }
+                    _ => base_interval,
+                };
+                tokio::time::sleep(sleep_duration).await;
             }
         });
 
