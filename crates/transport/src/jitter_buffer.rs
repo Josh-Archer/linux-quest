@@ -200,8 +200,13 @@ impl AdaptiveJitterBuffer {
             if self.received_parity_sequences.len() > 2048 {
                 if let Some(expected) = self.expected_unwrapped {
                     self.received_parity_sequences.retain(|&s| s >= expected);
-                } else if let Some(&oldest) = self.received_parity_sequences.iter().next() {
-                    self.received_parity_sequences.remove(&oldest);
+                }
+                while self.received_parity_sequences.len() > 2048 {
+                    if let Some(&oldest) = self.received_parity_sequences.iter().next() {
+                        self.received_parity_sequences.remove(&oldest);
+                    } else {
+                        break;
+                    }
                 }
             }
 
@@ -418,7 +423,6 @@ impl AdaptiveJitterBuffer {
         let m = tracker.m;
 
         if tracker.is_complete() {
-            self.fec_blocks.remove(&block_id);
             return false;
         }
 
@@ -464,11 +468,14 @@ impl AdaptiveJitterBuffer {
                 let stream_id = ref_pkt.header.stream_id;
                 let timestamp_us = ref_pkt.header.timestamp_us;
 
+                let mut max_rec_seq: Option<u64> = None;
                 for (idx, payload) in all_sources.into_iter().enumerate() {
                     if let std::collections::hash_map::Entry::Vacant(e) = tracker.sources.entry(idx)
                     {
                         let seq = base_seq.wrapping_add(idx as u32);
                         let unwrapped_seq = unwrapped_base + (idx as u64);
+                        max_rec_seq =
+                            Some(max_rec_seq.map_or(unwrapped_seq, |m| m.max(unwrapped_seq)));
                         if let std::collections::btree_map::Entry::Vacant(q_entry) =
                             self.queue.entry(unwrapped_seq)
                         {
@@ -497,11 +504,20 @@ impl AdaptiveJitterBuffer {
                         }
                     }
                 }
-                self.fec_blocks.remove(&block_id);
-                // Cap queue depth after inserting recovered packets (dropping excess from tail
-                // to preserve the newly reconstructed media packets at the playout cursor)
-                while self.queue.len() > self.config.max_queue_depth {
-                    self.queue.pop_last();
+
+                // Cap queue depth while preserving reconstructed packets.
+                // If recovered packet landed at or past the queue maximum, evict stale packets from the front.
+                // Otherwise, drop premature future packets from the tail.
+                if let Some(rec_max) = max_rec_seq {
+                    if let Some(&queue_max) = self.queue.keys().next_back() {
+                        if rec_max < queue_max {
+                            while self.queue.len() > self.config.max_queue_depth {
+                                self.queue.pop_last();
+                            }
+                        } else {
+                            self.evict_stale(self.config.max_queue_depth);
+                        }
+                    }
                 }
                 return true;
             }
@@ -610,11 +626,91 @@ impl AdaptiveJitterBuffer {
         false
     }
 
+    /// Counts how many sequence numbers in the half-open interval `[start, end)` correspond to parity packets.
+    /// Uses interval overlaps for active FEC blocks and range counting for received parity sequences,
+    /// avoiding loop iteration over large gaps.
+    fn count_parity_in_range(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+
+        if end - start <= 64 {
+            let mut count = 0;
+            for s in start..end {
+                if self.is_unwrapped_sequence_parity(s) {
+                    count += 1;
+                }
+            }
+            return count;
+        }
+
+        // For large gaps, merge block parity intervals and check received_parity_sequences
+        let mut intervals: Vec<(u64, u64)> = Vec::new();
+        for tracker in self.fec_blocks.values() {
+            if let Some(base) = tracker.unwrapped_base_seq {
+                if tracker.k > 0 && tracker.m > 0 {
+                    let p_start = base + tracker.k as u64;
+                    let p_end = p_start + tracker.m as u64;
+                    let o_start = start.max(p_start);
+                    let o_end = end.min(p_end);
+                    if o_end > o_start {
+                        intervals.push((o_start, o_end));
+                    }
+                }
+            }
+        }
+
+        intervals.sort_unstable_by_key(|&(s, _)| s);
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (s, e) in intervals {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+
+        let mut parity_count: u64 = merged.iter().map(|&(s, e)| e - s).sum();
+
+        // Include any received parity sequences not covered by block intervals
+        for &s in self.received_parity_sequences.range(start..end) {
+            let covered = merged.iter().any(|&(a, b)| s >= a && s < b);
+            if !covered {
+                parity_count += 1;
+            }
+        }
+
+        parity_count
+    }
+
+    /// Prunes completed FEC blocks where playout cursor has advanced past their entire sequence range.
+    fn prune_completed_fec_blocks(&mut self) {
+        if let Some(expected) = self.expected_unwrapped {
+            self.fec_blocks.retain(|_, tracker| {
+                if tracker.is_complete() {
+                    if let Some(base) = tracker.unwrapped_base_seq {
+                        let block_end = base + (tracker.k + tracker.m) as u64;
+                        return expected < block_end;
+                    }
+                }
+                true
+            });
+            self.received_parity_sequences.retain(|&s| s >= expected);
+        }
+    }
+
     /// Pops the next packet ready for playout if its target delay has elapsed.
     pub fn pop_ready_packet(&mut self, now: Instant) -> Option<Packet> {
         let target_delay = self.current_target_delay();
 
-        while let Some((&first_unwrapped_seq, item)) = self.queue.iter().next() {
+        while let Some(&first_unwrapped_seq) = self.queue.keys().next() {
+            let arrival_instant = match self.queue.get(&first_unwrapped_seq) {
+                Some(p) => p.arrival_instant,
+                None => break,
+            };
+
             if let Some(mut expected) = self.expected_unwrapped {
                 if first_unwrapped_seq < expected {
                     // Packet arrived after playout cursor has already advanced past it; discard
@@ -629,6 +725,7 @@ impl AdaptiveJitterBuffer {
                     expected += 1;
                     self.expected_unwrapped = Some(expected);
                 }
+                self.prune_completed_fec_blocks();
 
                 if first_unwrapped_seq > expected {
                     // Hole detected between expected and first_unwrapped_seq.
@@ -657,27 +754,21 @@ impl AdaptiveJitterBuffer {
                 }
             }
 
-            let age = now.duration_since(item.arrival_instant);
+            let age = now.duration_since(arrival_instant);
             if age >= target_delay {
                 let item = self.queue.remove(&first_unwrapped_seq)?;
                 if let Some(expected) = self.expected_unwrapped {
                     if first_unwrapped_seq > expected {
-                        let mut lost_media = 0;
-                        let gap_limit = first_unwrapped_seq.min(expected + 1024);
-                        for seq in expected..gap_limit {
-                            if !self.is_unwrapped_sequence_parity(seq) {
-                                lost_media += 1;
-                            }
-                            self.received_parity_sequences.remove(&seq);
-                        }
-                        if first_unwrapped_seq > gap_limit {
-                            lost_media += first_unwrapped_seq - gap_limit;
-                        }
+                        let total_gap = first_unwrapped_seq - expected;
+                        let parity_count =
+                            self.count_parity_in_range(expected, first_unwrapped_seq);
+                        let lost_media = total_gap.saturating_sub(parity_count);
                         self.stats.packets_lost += lost_media;
                     }
                 }
                 self.fec_hold_anchor = None;
                 self.expected_unwrapped = Some(first_unwrapped_seq + 1);
+                self.prune_completed_fec_blocks();
                 self.stats.packets_delivered += 1;
                 return Some(item.packet);
             } else {
@@ -700,23 +791,19 @@ impl AdaptiveJitterBuffer {
                     {
                         self.received_parity_sequences.remove(&expected);
                         expected += 1;
+                        self.expected_unwrapped = Some(expected);
                     }
+                    self.prune_completed_fec_blocks();
 
                     if first_unwrapped_seq >= expected {
-                        let mut lost = 0;
-                        let gap_limit = first_unwrapped_seq.min(expected + 1024);
-                        for seq in expected..gap_limit {
-                            if !self.is_unwrapped_sequence_parity(seq) {
-                                lost += 1;
-                            }
-                            self.received_parity_sequences.remove(&seq);
-                        }
-                        if first_unwrapped_seq > gap_limit {
-                            lost += first_unwrapped_seq - gap_limit;
-                        }
-                        lost += 1;
-                        self.stats.packets_lost += lost;
+                        let total_gap = first_unwrapped_seq - expected;
+                        let parity_count =
+                            self.count_parity_in_range(expected, first_unwrapped_seq);
+                        let lost_media = total_gap.saturating_sub(parity_count);
+                        // Plus 1 for first_unwrapped_seq itself being evicted
+                        self.stats.packets_lost += lost_media + 1;
                         self.expected_unwrapped = Some(first_unwrapped_seq + 1);
+                        self.prune_completed_fec_blocks();
                     }
                 } else {
                     self.stats.packets_lost += 1;
@@ -1827,5 +1914,197 @@ mod tests {
         assert_eq!(popped_s2.header.sequence, 4);
         assert_eq!(popped_s3.header.sequence, 5);
         assert_eq!(jb.stats().packets_delivered, 4);
+    }
+
+    #[test]
+    fn test_jitter_buffer_lost_parity_packet_does_not_inflate_media_loss() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // k=2, m=1, sources at sequences 1 and 2, parity sequence 3 NEVER ingested (lost on network)
+        let block1 = 5001;
+        let s0 = Bytes::from_static(b"data-1");
+        let s1 = Bytes::from_static(b"data-2");
+        jb.register_fec_block(block1, 2, 1);
+
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, block1, &s0)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s0,
+        );
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 2, block1, &s1)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            s1,
+        );
+        jb.ingest_packet(p1, now);
+        jb.ingest_packet(p2, now);
+
+        // Next media packet arrives at sequence 4 (Block 2)
+        let block2 = 5002;
+        let s2 = Bytes::from_static(b"data-4");
+        jb.register_fec_block(block2, 1, 0);
+        let p4 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 4, block2, &s2)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s2,
+        );
+        jb.ingest_packet(p4, now);
+
+        // Playout pops packets 1, 2, 4
+        let out1 = jb.pop_ready_packet(now).expect("Packet 1 must pop");
+        let out2 = jb.pop_ready_packet(now).expect("Packet 2 must pop");
+        let out4 = jb.pop_ready_packet(now).expect("Packet 4 must pop");
+
+        assert_eq!(out1.header.sequence, 1);
+        assert_eq!(out2.header.sequence, 2);
+        assert_eq!(out4.header.sequence, 4);
+
+        // Lost parity datagram at sequence 3 must NOT be counted as lost media!
+        assert_eq!(jb.stats().packets_lost, 0);
+        assert_eq!(jb.stats().packets_delivered, 3);
+        assert_eq!(jb.stats().loss_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_jitter_buffer_large_gap_past_1024_does_not_count_parity_as_loss() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Packet 1000 arrives and plays -> expected is 1001
+        let p1000 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1000, 1000, b"p1000"),
+            Bytes::from_static(b"p1000"),
+        );
+        jb.ingest_packet(p1000, now);
+        let _ = jb.pop_ready_packet(now);
+        assert_eq!(jb.expected_sequence(), Some(1001));
+
+        // Parity packet received at sequence 1500 (inside gap 1001..2000, >1024 size)
+        let block_mid = 1500;
+        let payload = Bytes::from_static(b"parity");
+        let parity_pkt = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 1500, block_mid, &payload),
+            payload,
+        );
+        jb.ingest_packet(parity_pkt, now);
+
+        // Next media packet arrives at sequence 2000 (total gap 999 sequences, with 1 parity)
+        let p2000 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 2000, 2000, b"p2000"),
+            Bytes::from_static(b"p2000"),
+        );
+        jb.ingest_packet(p2000, now);
+
+        let out2000 = jb.pop_ready_packet(now).expect("Packet 2000 must pop");
+        assert_eq!(out2000.header.sequence, 2000);
+
+        // Gap is [1001, 2000) = 999 sequence numbers. Sequence 1500 is parity.
+        // Exactly 998 media packets must be counted as lost, NOT 999!
+        assert_eq!(jb.stats().packets_lost, 998);
+        assert_eq!(jb.stats().packets_delivered, 2);
+    }
+
+    #[test]
+    fn test_jitter_buffer_fec_recovery_at_queue_max_is_not_dropped() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            max_queue_depth: 2,
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Depth 2, sources 10 and 11, recover sequence 12 (queue maximum)
+        let block = 9999;
+        let s0 = Bytes::from_static(b"s10");
+        let s1 = Bytes::from_static(b"s11");
+        let s2 = Bytes::from_static(b"s12");
+        let parities =
+            ReedSolomonFec::encode(block, &[s0.clone(), s1.clone(), s2.clone()], 1).unwrap();
+        jb.register_fec_block(block, 3, 1);
+
+        let p10 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block, &s0)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s0,
+        );
+        let p11 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 11, block, &s1)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            s1,
+        );
+        jb.ingest_packet(p10, now);
+        jb.ingest_packet(p11, now);
+        assert_eq!(jb.queue_len(), 2);
+
+        // Parity arrives and reconstructs sequence 12 (which is the queue maximum!)
+        let p_parity = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 13, block, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+        jb.ingest_packet(p_parity, now);
+
+        assert_eq!(jb.stats().packets_reconstructed_fec, 1);
+        assert_eq!(jb.queue_len(), 2, "Queue clamped to max_queue_depth 2");
+
+        // The reconstructed sequence 12 must NOT be dropped!
+        // Playout delivers packet 11 and packet 12!
+        let out11 = jb.pop_ready_packet(now).expect("Packet 11 must pop");
+        let out12 = jb
+            .pop_ready_packet(now)
+            .expect("Reconstructed packet 12 must pop!");
+        assert_eq!(out11.header.sequence, 11);
+        assert_eq!(out12.header.sequence, 12);
+        assert_eq!(jb.stats().packets_delivered, 2);
+    }
+
+    #[test]
+    fn test_jitter_buffer_received_parity_sequences_strictly_capped_at_2048() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Ingest packet 1 and pop it -> expected cursor is Some(2)
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, 100, b"p1"),
+            Bytes::from_static(b"p1"),
+        );
+        jb.ingest_packet(p1, now);
+        let _ = jb.pop_ready_packet(now);
+        assert_eq!(jb.expected_sequence(), Some(2));
+
+        // Now flood 3000 parity packets ahead of the cursor (all seq >= expected)
+        for seq in 100..3100 {
+            let p = Packet::new(
+                PacketHeader::new(PacketType::FecParity, 0, seq, 1000, b"par"),
+                Bytes::from_static(b"par"),
+            );
+            jb.ingest_packet(p, now);
+        }
+
+        // received_parity_sequences MUST be strictly capped at 2048!
+        assert!(
+            jb.received_parity_sequences.len() <= 2048,
+            "received_parity_sequences len {} exceeded 2048 cap!",
+            jb.received_parity_sequences.len()
+        );
     }
 }
