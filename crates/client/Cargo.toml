@@ -1,0 +1,35 @@
+[package]
+name = "linux-quest-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+linux-quest-protocol = { path = "../protocol" }
+linux-quest-transport = { path = "../transport" }
+openxr = { version = "0.22", default-features = true }
+ash = "0.38"
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+bytes.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+crc32fast.workspace = true
+serde = { workspace = true, features = ["derive"] }
+libc.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", features = ["media", "nativewindow", "sync", "api-level-30"] }
+ndk-sys = "0.6"
+ndk-context = "0.1"
+android-activity = { version = "0.6", features = ["native-activity"] }
+jni = "0.21"
+
+[dev-dependencies]
