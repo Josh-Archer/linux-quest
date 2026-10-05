@@ -302,6 +302,8 @@ impl AdaptiveJitterBuffer {
         let target_delay = self.current_target_delay();
         self.stats.current_target_delay_us = target_delay.as_micros() as u64;
 
+        let mut rec_max: Option<u64> = None;
+
         // Check if packet belongs to an FEC protected block
         if (packet.header.flags & FLAG_FEC_PROTECTED) != 0 {
             let block_id = packet.header.timestamp_us; // Group by frame/block timestamp
@@ -344,7 +346,7 @@ impl AdaptiveJitterBuffer {
                 };
                 if consistent {
                     tracker.sources.insert(idx, (seq, packet.clone()));
-                    self.try_fec_recovery(block_id, now);
+                    rec_max = self.try_fec_recovery(block_id, now);
                 } else {
                     tracing::warn!(
                         "Inconsistent FEC (seq, index) in block {}: seq={}, idx={}, expected_base={:?}",
@@ -362,17 +364,18 @@ impl AdaptiveJitterBuffer {
             },
         );
 
-        // Enforce maximum queue depth to prevent unbounded memory growth.
-        // If the newly arrived packet filled a hole in the past (unwrapped_seq < max_seq in queue),
-        // it must not be evicted from the front (which would discard the in-order/hole-fill packet
-        // and falsely increment packets_lost). Instead, drop excess future packets from the tail.
-        if let Some(&max_seq) = self.queue.keys().next_back() {
-            if unwrapped_seq < max_seq {
-                while self.queue.len() > self.config.max_queue_depth {
+        // Enforce maximum queue depth while preserving in-order arrivals and reconstructions.
+        // Drop premature future packets from the tail that arrived ahead of this sequence or recovered block.
+        // If queue depth still exceeds the limit, evict stale packets from the front.
+        let highest_protected = unwrapped_seq.max(rec_max.unwrap_or(unwrapped_seq));
+        while self.queue.len() > self.config.max_queue_depth {
+            if let Some(&tail_seq) = self.queue.keys().next_back() {
+                if tail_seq > highest_protected {
                     self.queue.pop_last();
+                    continue;
                 }
-                return;
             }
+            break;
         }
 
         self.evict_stale(self.config.max_queue_depth);
@@ -419,22 +422,23 @@ impl AdaptiveJitterBuffer {
     }
 
     /// Attempts FEC recovery on a block if enough data + parity packets are available.
-    pub fn try_fec_recovery(&mut self, block_id: u64, _now: Instant) -> bool {
+    /// Returns the maximum reconstructed unwrapped sequence number if packets were recovered.
+    pub fn try_fec_recovery(&mut self, block_id: u64, _now: Instant) -> Option<u64> {
         let tracker = match self.fec_blocks.get_mut(&block_id) {
             Some(t) if t.k > 0 => t,
-            _ => return false,
+            _ => return None,
         };
 
         let k = tracker.k;
         let m = tracker.m;
 
         if tracker.is_complete() {
-            return false;
+            return None;
         }
 
         let available = tracker.sources.len() + tracker.parities.len();
         if available < k {
-            return false;
+            return None;
         }
 
         let mut source_payloads: HashMap<usize, Bytes> =
@@ -460,14 +464,8 @@ impl AdaptiveJitterBuffer {
 
         if let Ok(all_sources) = recovered {
             let ref_arrival = tracker.first_arrival;
-            let base_seq = match tracker.base_sequence {
-                Some(b) => b,
-                None => return false,
-            };
-            let unwrapped_base = match tracker.unwrapped_base_seq {
-                Some(b) => b,
-                None => return false,
-            };
+            let base_seq = tracker.base_sequence?;
+            let unwrapped_base = tracker.unwrapped_base_seq?;
             let ref_entry = tracker.sources.values().next();
             if let Some((_ref_seq, ref_pkt)) = ref_entry {
                 let packet_type = ref_pkt.header.packet_type;
@@ -532,11 +530,11 @@ impl AdaptiveJitterBuffer {
                     }
                     self.evict_stale(self.config.max_queue_depth);
                 }
-                return true;
+                return max_rec_seq;
             }
         }
 
-        false
+        None
     }
 
     /// Checks whether a missing sequence number belongs to an active, incomplete FEC block
@@ -569,8 +567,14 @@ impl AdaptiveJitterBuffer {
         false
     }
 
-    /// Unwrapped 64-bit sequence check for FEC recoverability.
-    fn is_unwrapped_sequence_fec_recoverable(&self, missing_unwrapped: u64) -> bool {
+    /// Checks whether any missing sequence number in the half-open interval `[start, end)`
+    /// belongs to an active, incomplete FEC block that can still be reconstructed.
+    /// Iterates over active FEC blocks (at most MAX_FEC_BLOCKS = 64) rather than the gap width.
+    fn has_fec_recoverable_in_range(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+
         for tracker in self.fec_blocks.values() {
             let k = tracker.k;
             let m = tracker.m;
@@ -578,32 +582,41 @@ impl AdaptiveJitterBuffer {
                 continue;
             }
 
+            let missing_count = k.saturating_sub(tracker.sources.len());
+            if missing_count == 0 || missing_count > m {
+                continue;
+            }
+
             if let Some(unwrapped_base) = tracker.unwrapped_base_seq {
-                if missing_unwrapped >= unwrapped_base
-                    && missing_unwrapped < unwrapped_base + (k as u64)
-                {
-                    let missing_idx = (missing_unwrapped - unwrapped_base) as usize;
-                    if !tracker.sources.contains_key(&missing_idx) {
-                        let missing_count = k.saturating_sub(tracker.sources.len());
-                        if missing_count > 0 && missing_count <= m {
-                            return true;
+                let block_start = unwrapped_base;
+                let block_end = unwrapped_base + (k as u64);
+                if block_start < end && block_end > start {
+                    for idx in 0..k {
+                        if !tracker.sources.contains_key(&idx) {
+                            let seq = block_start + (idx as u64);
+                            if seq >= start && seq < end {
+                                return true;
+                            }
                         }
                     }
                 }
             } else if let Some(base_seq) = tracker.base_sequence {
-                let missing_seq = missing_unwrapped as u32;
-                let offset = missing_seq.wrapping_sub(base_seq);
-                if offset < (k as u32) {
-                    let missing_idx = offset as usize;
-                    if !tracker.sources.contains_key(&missing_idx) {
-                        let missing_count = k.saturating_sub(tracker.sources.len());
-                        if missing_count > 0 && missing_count <= m {
-                            return true;
+                let start_wire = start as u32;
+                let gap_width = end.saturating_sub(start);
+                if gap_width < (1u64 << 31) {
+                    let gap_wire = gap_width as u32;
+                    for idx in 0..k {
+                        if !tracker.sources.contains_key(&idx) {
+                            let seq = base_seq.wrapping_add(idx as u32);
+                            if seq.wrapping_sub(start_wire) < gap_wire {
+                                return true;
+                            }
                         }
                     }
                 }
             }
         }
+
         false
     }
 
@@ -745,9 +758,8 @@ impl AdaptiveJitterBuffer {
                     // If ANY missing sequence in the gap belongs to an incomplete recoverable FEC block
                     // (accounting for parity packets consuming sequence numbers without being queued),
                     // hold playout up to fec_hold_timeout anchored to when the hole was first detected.
-                    let gap_has_recoverable = (expected
-                        ..first_unwrapped_seq.min(expected + (MAX_FEC_K as u64)))
-                        .any(|seq| self.is_unwrapped_sequence_fec_recoverable(seq));
+                    let gap_has_recoverable =
+                        self.has_fec_recoverable_in_range(expected, first_unwrapped_seq);
 
                     if gap_has_recoverable {
                         let hold_start = match self.fec_hold_anchor {
@@ -2339,5 +2351,128 @@ mod tests {
             1,
             "Only evicted packet 10 should be counted lost"
         );
+    }
+
+    #[test]
+    fn test_jitter_buffer_source_triggered_recovery_does_not_tail_drop_reconstructed_packet() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_queue_depth: 3,
+            ..Default::default()
+        });
+
+        let now = Instant::now();
+        let block_id = 1000;
+        let p10_payload = Bytes::from_static(b"source-10");
+        let p11_payload = Bytes::from_static(b"source-11");
+        let p12_payload = Bytes::from_static(b"source-12");
+
+        let parities = ReedSolomonFec::encode(
+            block_id,
+            &[
+                p10_payload.clone(),
+                p11_payload.clone(),
+                p12_payload.clone(),
+            ],
+            2,
+        )
+        .expect("FEC encode should succeed");
+
+        // Queue initially has sequences 5, 6, and 7
+        for seq in 5..=7 {
+            let p = Packet::new(
+                PacketHeader::new(PacketType::VideoFrameChunk, 0, seq, 100, b"data"),
+                Bytes::from_static(b"data"),
+            );
+            jb.ingest_packet(p, now);
+        }
+        assert_eq!(jb.queue_len(), 3);
+
+        // Register FEC block for 10, 11, 12
+        jb.register_fec_block(block_id, 3, 2);
+
+        // Ingest both parities (sequences 13 and 14)
+        let p_par0 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 13, block_id, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+        let p_par1 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 14, block_id, &parities[1])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[1].clone(),
+        );
+        jb.ingest_packet(p_par0, now);
+        jb.ingest_packet(p_par1, now);
+
+        // Now source packet 11 arrives (index 1), which completes the required K packets
+        // and triggers recovery of source packets 10 and 12!
+        let p11 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 11, block_id, &p11_payload)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            p11_payload,
+        );
+        jb.ingest_packet(p11, now);
+
+        // Both 10 and 12 were reconstructed
+        assert_eq!(jb.stats().packets_reconstructed_fec, 2);
+        // Queue capping must have evicted older packets 5, 6, 7 from the front,
+        // keeping {10, 11, 12} intact!
+        assert_eq!(jb.queue_len(), 3);
+
+        let out10 = jb.pop_ready_packet(now).expect("Packet 10 must pop");
+        let out11 = jb.pop_ready_packet(now).expect("Packet 11 must pop");
+        let out12 = jb.pop_ready_packet(now).expect("Packet 12 must pop");
+        assert_eq!(out10.header.sequence, 10);
+        assert_eq!(out11.header.sequence, 11);
+        assert_eq!(out12.header.sequence, 12);
+        assert_eq!(jb.stats().packets_delivered, 3);
+    }
+
+    #[test]
+    fn test_jitter_buffer_fec_hold_inspects_gap_beyond_256_packets() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            fec_hold_timeout: Duration::from_millis(50),
+            ..Default::default()
+        });
+
+        let t0 = Instant::now();
+        // Ingest packet 1 and pop it -> expected cursor is 2
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, 100, b"p1"),
+            Bytes::from_static(b"p1"),
+        );
+        jb.ingest_packet(p1, t0);
+        let out1 = jb.pop_ready_packet(t0).expect("Packet 1 must pop");
+        assert_eq!(out1.header.sequence, 1);
+        assert_eq!(jb.expected_sequence(), Some(2));
+
+        // Block with base 300, k=2, m=1
+        // Source 300 is missing (index 0)
+        // Source 301 is present (index 1)
+        let block_id = 9000;
+        jb.register_fec_block(block_id, 2, 1);
+        let p301 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 301, block_id, b"p301")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            Bytes::from_static(b"p301"),
+        );
+        jb.ingest_packet(p301, t0);
+
+        // Gap between expected (2) and head (301) is 299 packets (> 256).
+        // Since sequence 300 in that gap belongs to recoverable block 9000,
+        // playout MUST hold rather than immediately popping 301 and declaring 300 lost!
+        let t1 = t0 + Duration::from_millis(10);
+        let out = jb.pop_ready_packet(t1);
+        assert!(
+            out.is_none(),
+            "Playout must hold for recoverable packet 300 despite gap > 256"
+        );
+        assert_eq!(jb.expected_sequence(), Some(2));
     }
 }
