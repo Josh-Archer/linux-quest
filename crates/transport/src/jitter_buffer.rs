@@ -104,6 +104,7 @@ pub struct AdaptiveJitterBuffer {
     last_sender_timestamp_us: Option<u64>,
     highest_seen_unwrapped: Option<u64>,
     expected_unwrapped: Option<u64>,
+    fec_hold_anchor: Option<(u64, Instant)>,
 
     queue: BTreeMap<u64, QueuedPacket>,
     fec_blocks: HashMap<u64, FecBlockTracker>,
@@ -121,6 +122,7 @@ impl AdaptiveJitterBuffer {
             last_sender_timestamp_us: None,
             highest_seen_unwrapped: None,
             expected_unwrapped: None,
+            fec_hold_anchor: None,
             queue: BTreeMap::new(),
             fec_blocks: HashMap::new(),
             stats: JitterBufferStats::default(),
@@ -251,6 +253,13 @@ impl AdaptiveJitterBuffer {
             }
         }
 
+        // Discard duplicate packets immediately if already present in queue.
+        // This prevents retransmissions from overwriting arrival_instant (which would restart
+        // playout delay and FEC hold timers) and prevents duplicates from polluting RFC 3550 jitter estimates.
+        if self.queue.contains_key(&unwrapped_seq) {
+            return;
+        }
+
         // Media packets: RFC 3550 Interarrival Jitter Calculation
         if let (Some(last_arr), Some(last_ts)) =
             (self.last_arrival_instant, self.last_sender_timestamp_us)
@@ -321,9 +330,6 @@ impl AdaptiveJitterBuffer {
             }
         }
 
-        // Enforce maximum queue depth to prevent unbounded memory growth
-        self.evict_stale(self.config.max_queue_depth.saturating_sub(1));
-
         self.queue.insert(
             unwrapped_seq,
             QueuedPacket {
@@ -331,6 +337,11 @@ impl AdaptiveJitterBuffer {
                 arrival_instant: now,
             },
         );
+
+        // Enforce maximum queue depth to prevent unbounded memory growth.
+        // Eviction runs strictly AFTER insertion so that a newly arrived in-order
+        // packet filling a hole is never skipped or pre-emptively evicted by cursor advancement.
+        self.evict_stale(self.config.max_queue_depth);
     }
 
     /// Registers FEC block parameters for a block of source packets with default ReedSolomon scheme.
@@ -555,14 +566,28 @@ impl AdaptiveJitterBuffer {
 
                 if first_unwrapped_seq > expected {
                     // Hole detected between expected and first_unwrapped_seq.
-                    // If the missing sequence is part of an incomplete recoverable FEC block,
-                    // hold playout up to fec_hold_timeout for parity recovery.
-                    if self.is_unwrapped_sequence_fec_recoverable(expected) {
-                        let age = now.duration_since(item.arrival_instant);
-                        if age < target_delay + self.config.fec_hold_timeout {
+                    // If ANY missing sequence in the gap belongs to an incomplete recoverable FEC block
+                    // (accounting for parity packets consuming sequence numbers without being queued),
+                    // hold playout up to fec_hold_timeout anchored to when the hole was first detected.
+                    let gap_has_recoverable = (expected
+                        ..first_unwrapped_seq.min(expected + (MAX_FEC_K as u64)))
+                        .any(|seq| self.is_unwrapped_sequence_fec_recoverable(seq));
+
+                    if gap_has_recoverable {
+                        let hold_start = match self.fec_hold_anchor {
+                            Some((held_seq, start)) if held_seq == expected => start,
+                            _ => {
+                                self.fec_hold_anchor = Some((expected, now));
+                                now
+                            }
+                        };
+
+                        if now.duration_since(hold_start) < self.config.fec_hold_timeout {
                             return None;
                         }
                     }
+                    // Hole is not recoverable or FEC hold deadline has expired: clear anchor
+                    self.fec_hold_anchor = None;
                 }
             }
 
@@ -575,6 +600,7 @@ impl AdaptiveJitterBuffer {
                         self.stats.packets_lost += diff;
                     }
                 }
+                self.fec_hold_anchor = None;
                 self.expected_unwrapped = Some(first_unwrapped_seq + 1);
                 self.stats.packets_delivered += 1;
                 return Some(item.packet);
@@ -1422,5 +1448,194 @@ mod tests {
             jb.fec_blocks.len(),
             MAX_FEC_BLOCKS
         );
+    }
+
+    #[test]
+    fn test_jitter_buffer_duplicate_packet_does_not_restart_playout_or_fec_hold() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, 1000, b"data1"),
+            Bytes::from_static(b"data1"),
+        );
+        jb.ingest_packet(p1.clone(), now);
+
+        // Arrive again 4ms later as a network duplicate
+        let t_dup = now + Duration::from_millis(4);
+        jb.ingest_packet(p1, t_dup);
+
+        // At now + 5.1ms, original target_delay (5ms) has elapsed since first arrival (now)
+        let playout = now + Duration::from_millis(5) + Duration::from_micros(100);
+        let popped = jb
+            .pop_ready_packet(playout)
+            .expect("Packet 1 must pop based on first arrival, not delayed by duplicate");
+        assert_eq!(popped.header.sequence, 1);
+        assert_eq!(
+            jb.stats().current_jitter_us,
+            0.0,
+            "Duplicate packet must not corrupt jitter estimate"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_eviction_after_insert_does_not_delete_both_packets() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            max_queue_depth: 3,
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Packet 10 is ingested and played -> expected cursor is 11
+        let p10 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, 1000, b"data10"),
+            Bytes::from_static(b"data10"),
+        );
+        jb.ingest_packet(p10, now);
+        let popped_10 = jb.pop_ready_packet(now).unwrap();
+        assert_eq!(popped_10.header.sequence, 10);
+        assert_eq!(jb.expected_sequence(), Some(11));
+
+        // Packets 12, 13, 14 arrive while packet 11 is in transit (queue full to max depth 3)
+        for seq in 12..=14 {
+            let p = Packet::new(
+                PacketHeader::new(PacketType::VideoFrameChunk, 0, seq, 1000, b"data"),
+                Bytes::from_static(b"data"),
+            );
+            jb.ingest_packet(p, now);
+        }
+        assert_eq!(jb.queue_len(), 3);
+
+        // Now packet 11 arrives. Eviction must run AFTER insert, so packet 12 is preserved!
+        let p11 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 11, 1000, b"data11"),
+            Bytes::from_static(b"data11"),
+        );
+        jb.ingest_packet(p11, now);
+
+        // In the previous buggy code, 12 was pre-evicted and cursor became 13, so both 11 and 12 were deleted.
+        // With eviction after insert, packet 12 is preserved and delivered!
+        let out12 = jb
+            .pop_ready_packet(now)
+            .expect("Packet 12 must be ready to play");
+        assert_eq!(out12.header.sequence, 12);
+
+        let out13 = jb
+            .pop_ready_packet(now)
+            .expect("Packet 13 must be ready to play");
+        assert_eq!(out13.header.sequence, 13);
+
+        let out14 = jb
+            .pop_ready_packet(now)
+            .expect("Packet 14 must be ready to play");
+        assert_eq!(out14.header.sequence, 14);
+    }
+
+    #[test]
+    fn test_jitter_buffer_fec_hold_inspects_entire_gap_past_parity_sequence() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            fec_hold_timeout: Duration::from_millis(20),
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Block 1 (Frame 1):
+        // Source 0 (seq 1), Source 1 (seq 2), Parity 0 (seq 3)
+        let block1 = 1111;
+        let s0 = Bytes::from_static(b"f1-s0");
+        let s1 = Bytes::from_static(b"f1-s1");
+        let sources1 = vec![s0.clone(), s1.clone()];
+        let parities1 = ReedSolomonFec::encode(block1, &sources1, 1).unwrap();
+        jb.register_fec_block(block1, 2, 1);
+
+        // Ingest and play Block 1
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, block1, &s0)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s0,
+        );
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 2, block1, &s1)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            s1,
+        );
+        let p_parity1 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 3, block1, &parities1[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities1[0].clone(),
+        );
+        jb.ingest_packet(p0, now);
+        jb.ingest_packet(p1, now);
+        jb.ingest_packet(p_parity1, now);
+
+        let playout_1 = now + Duration::from_millis(10);
+        let popped_0 = jb.pop_ready_packet(playout_1).unwrap();
+        let popped_1 = jb.pop_ready_packet(playout_1).unwrap();
+        assert_eq!(popped_0.header.sequence, 1);
+        assert_eq!(popped_1.header.sequence, 2);
+        // Expected cursor is now 3 (the sequence consumed by parity packet 3!)
+        assert_eq!(jb.expected_sequence(), Some(3));
+
+        // Block 2 (Frame 2):
+        // Source 0 (seq 4 - LOST IN TRANSIT), Source 1 (seq 5), Parity 0 (seq 6)
+        let block2 = 2222;
+        let s2 = Bytes::from_static(b"f2-s0");
+        let s3 = Bytes::from_static(b"f2-s1");
+        let sources2 = vec![s2.clone(), s3.clone()];
+        let parities2 = ReedSolomonFec::encode(block2, &sources2, 1).unwrap();
+        jb.register_fec_block(block2, 2, 1);
+
+        // Only packet 5 arrives from Block 2 (packet 4 is missing)
+        let p3 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 5, block2, &s3)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            s3,
+        );
+        jb.ingest_packet(p3, now);
+
+        // Playout check:
+        // Expected cursor is 3 (parity). Missing gap is [3, 5).
+        // Sequence 4 in this gap is FEC-recoverable!
+        // Playout MUST HOLD instead of immediately skipping 3..5 and popping 5!
+        let hold_check = jb.pop_ready_packet(playout_1);
+        assert!(
+            hold_check.is_none(),
+            "Playout must hold because sequence 4 in gap [3, 5) is FEC-recoverable!"
+        );
+
+        // Now parity for Block 2 arrives within hold window
+        let p_parity2 = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 6, block2, &parities2[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities2[0].clone(),
+        );
+        jb.ingest_packet(p_parity2, now + Duration::from_millis(2));
+
+        // Sequence 4 must have been reconstructed!
+        assert_eq!(jb.stats().packets_reconstructed_fec, 1);
+
+        // Now pop ready packets:
+        let playout_2 = now + Duration::from_millis(15);
+        let popped_s2 = jb
+            .pop_ready_packet(playout_2)
+            .expect("Reconstructed sequence 4 must pop!");
+        let popped_s3 = jb
+            .pop_ready_packet(playout_2)
+            .expect("Sequence 5 must pop next!");
+
+        assert_eq!(popped_s2.header.sequence, 4);
+        assert_eq!(popped_s3.header.sequence, 5);
+        assert_eq!(jb.stats().packets_delivered, 4);
     }
 }
