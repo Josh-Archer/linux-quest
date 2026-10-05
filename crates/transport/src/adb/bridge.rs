@@ -101,10 +101,6 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                     };
 
                     if matches_target && matches_filter && dev.state == AdbDeviceState::Device {
-                        let _ = self
-                            .event_sender
-                            .send(AdbBridgeEvent::DeviceConnected(dev.clone()));
-
                         // Establish reverse port forwarding
                         match self
                             .runner
@@ -120,6 +116,9 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                                     serial: dev.serial.clone(),
                                     model: dev.model.clone(),
                                 };
+                                let _ = self
+                                    .event_sender
+                                    .send(AdbBridgeEvent::DeviceConnected(dev.clone()));
                                 let evt = AdbBridgeEvent::ReversePortEstablished {
                                     serial: dev.serial,
                                     port: self.config.remote_port,

@@ -90,6 +90,12 @@ impl FecBlockTracker {
 const SEQUENCE_EPOCH_OFFSET: u64 = 1u64 << 32;
 
 /// Maximum number of active FEC blocks tracked simultaneously in memory.
+///
+/// Parity packets are identified across sequence gaps either via active tracked FEC blocks
+/// in `fec_blocks` or via explicit retention in `received_parity_sequences` (bounded up to 2048 entries).
+/// Even if an ancient FEC block is evicted or pruned once playout advances past its sequence range,
+/// parity sequence numbers that were actually received remain tracked to prevent miscounting
+/// parity packet sequences as lost media packets.
 pub const MAX_FEC_BLOCKS: usize = 64;
 
 /// Maximum number of source packets (K) allowed per FEC block in GF(2^8).
@@ -474,33 +480,42 @@ impl AdaptiveJitterBuffer {
                     {
                         let seq = base_seq.wrapping_add(idx as u32);
                         let unwrapped_seq = unwrapped_base + (idx as u64);
-                        max_rec_seq =
-                            Some(max_rec_seq.map_or(unwrapped_seq, |m| m.max(unwrapped_seq)));
-                        if let std::collections::btree_map::Entry::Vacant(q_entry) =
-                            self.queue.entry(unwrapped_seq)
-                        {
-                            let rec_header = PacketHeader::new(
-                                packet_type,
-                                stream_id,
-                                seq,
-                                timestamp_us,
-                                &payload,
-                            )
-                            .with_flags(FLAG_FEC_PROTECTED)
-                            .with_fec_index(idx as u16);
 
-                            let recovered_packet = Packet::new(rec_header, payload);
-                            q_entry.insert(QueuedPacket {
-                                packet: recovered_packet.clone(),
-                                arrival_instant: ref_arrival,
-                            });
-                            e.insert((seq, recovered_packet));
-                            if let Some(highest) = self.highest_seen_unwrapped {
-                                if unwrapped_seq > highest {
-                                    self.highest_seen_unwrapped = Some(unwrapped_seq);
+                        let rec_header =
+                            PacketHeader::new(packet_type, stream_id, seq, timestamp_us, &payload)
+                                .with_flags(FLAG_FEC_PROTECTED)
+                                .with_fec_index(idx as u16);
+
+                        let recovered_packet = Packet::new(rec_header, payload);
+                        e.insert((seq, recovered_packet.clone()));
+
+                        // Discard recovered packets older than playout cursor.
+                        // Late recovery behind expected playout cursor must not be inserted into the queue,
+                        // must not increment packets_reconstructed_fec, and must not trigger queue capping
+                        // which would evict valid future packets from the tail.
+                        let is_stale = match self.expected_unwrapped {
+                            Some(expected) => unwrapped_seq < expected,
+                            None => false,
+                        };
+
+                        if !is_stale {
+                            if let std::collections::btree_map::Entry::Vacant(q_entry) =
+                                self.queue.entry(unwrapped_seq)
+                            {
+                                max_rec_seq = Some(
+                                    max_rec_seq.map_or(unwrapped_seq, |m| m.max(unwrapped_seq)),
+                                );
+                                q_entry.insert(QueuedPacket {
+                                    packet: recovered_packet,
+                                    arrival_instant: ref_arrival,
+                                });
+                                if let Some(highest) = self.highest_seen_unwrapped {
+                                    if unwrapped_seq > highest {
+                                        self.highest_seen_unwrapped = Some(unwrapped_seq);
+                                    }
                                 }
+                                self.stats.packets_reconstructed_fec += 1;
                             }
-                            self.stats.packets_reconstructed_fec += 1;
                         }
                     }
                 }
@@ -685,11 +700,11 @@ impl AdaptiveJitterBuffer {
         parity_count
     }
 
-    /// Prunes completed FEC blocks where playout cursor has advanced past their entire sequence range.
+    /// Prunes completed or expired FEC blocks where playout cursor has advanced past their entire sequence range.
     fn prune_completed_fec_blocks(&mut self) {
         if let Some(expected) = self.expected_unwrapped {
             self.fec_blocks.retain(|_, tracker| {
-                if tracker.is_complete() {
+                if tracker.k > 0 {
                     if let Some(base) = tracker.unwrapped_base_seq {
                         let block_end = base + (tracker.k + tracker.m) as u64;
                         return expected < block_end;
@@ -2105,6 +2120,149 @@ mod tests {
             jb.received_parity_sequences.len() <= 2048,
             "received_parity_sequences len {} exceeded 2048 cap!",
             jb.received_parity_sequences.len()
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_late_fec_recovery_behind_expected_does_not_evict_future_packets() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(5),
+            fec_hold_timeout: Duration::from_millis(10),
+            max_queue_depth: 2,
+            ..Default::default()
+        });
+
+        let t0 = Instant::now();
+        let block_id = 1000;
+        let p10_payload = Bytes::from_static(b"source-10");
+        let p11_payload = Bytes::from_static(b"source-11");
+        let p12_payload = Bytes::from_static(b"source-12");
+
+        // Encode Reed-Solomon FEC block for k=3, m=1
+        let parities = ReedSolomonFec::encode(
+            block_id,
+            &[
+                p10_payload.clone(),
+                p11_payload.clone(),
+                p12_payload.clone(),
+            ],
+            1,
+        )
+        .expect("FEC encode should succeed");
+
+        // Step 1: Ingest source 10 and 12 (source 11 is missing)
+        let p10 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, &p10_payload)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            p10_payload,
+        );
+        let p12 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 12, block_id, &p12_payload)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(2),
+            p12_payload,
+        );
+        jb.register_fec_block(block_id, 3, 1);
+        jb.ingest_packet(p10, t0);
+        jb.ingest_packet(p12, t0);
+
+        // At t0 + 10ms (> initial_target_delay), pop packet 10
+        let t1 = t0 + Duration::from_millis(10);
+        let out10 = jb.pop_ready_packet(t1).expect("Packet 10 should pop");
+        assert_eq!(out10.header.sequence, 10);
+        assert_eq!(jb.expected_sequence(), Some(11));
+
+        // Playout holds waiting for missing recoverable packet 11
+        assert!(jb.pop_ready_packet(t1).is_none());
+
+        // At t1 + 15ms (> fec_hold_timeout), playout hold expires:
+        // packet 11 is declared lost, expected cursor moves to 12, and packet 12 is popped!
+        let t2 = t1 + Duration::from_millis(15);
+        let out12 = jb
+            .pop_ready_packet(t2)
+            .expect("Packet 12 should pop after hold timeout");
+        assert_eq!(out12.header.sequence, 12);
+        assert_eq!(jb.stats().packets_lost, 1);
+        assert_eq!(jb.expected_sequence(), Some(13));
+        assert_eq!(jb.queue_len(), 0);
+
+        // Step 2: Ingest future packets 20 and 21, filling queue to max_queue_depth 2
+        let p20 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 20, 2000, b"p20"),
+            Bytes::from_static(b"p20"),
+        );
+        let p21 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 21, 2000, b"p21"),
+            Bytes::from_static(b"p21"),
+        );
+        jb.ingest_packet(p20, t2);
+        jb.ingest_packet(p21, t2);
+        assert_eq!(jb.queue_len(), 2);
+
+        // Step 3: Late parity packet arrives for the old block (block_id 1000)
+        let p_parity = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 13, block_id, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+        jb.ingest_packet(p_parity, t2);
+
+        // Packet 11 was recovered but is behind expected (13); it must NOT be inserted into queue,
+        // must NOT increment packets_reconstructed_fec, and must NOT evict future packet 21!
+        assert_eq!(jb.stats().packets_reconstructed_fec, 0);
+        assert_eq!(jb.queue_len(), 2, "Queue must remain 2 with [20, 21]");
+
+        // Playout delivers packet 20 and 21 cleanly!
+        let t3 = t2 + Duration::from_millis(10);
+        let out20 = jb.pop_ready_packet(t3).expect("Packet 20 must pop");
+        let out21 = jb.pop_ready_packet(t3).expect("Packet 21 must pop");
+        assert_eq!(out20.header.sequence, 20);
+        assert_eq!(out21.header.sequence, 21);
+        assert_eq!(jb.stats().packets_delivered, 4); // 10, 12, 20, 21
+    }
+
+    #[test]
+    fn test_jitter_buffer_prunes_incomplete_expired_fec_blocks() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            fec_hold_timeout: Duration::from_millis(5),
+            ..Default::default()
+        });
+
+        let t0 = Instant::now();
+        let block_id = 5000;
+        let p10 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, b"p10")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            Bytes::from_static(b"p10"),
+        );
+        jb.register_fec_block(block_id, 3, 1);
+        jb.ingest_packet(p10, t0);
+
+        // Pop packet 10 -> expected is 11
+        let _ = jb.pop_ready_packet(t0);
+        assert_eq!(jb.expected_sequence(), Some(11));
+        assert!(jb.fec_blocks.contains_key(&block_id));
+
+        // Advance playout past the entire block range (base 10 + k 3 + m 1 = 14)
+        // by ingesting and popping packet 15
+        let p15 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 15, 6000, b"p15"),
+            Bytes::from_static(b"p15"),
+        );
+        let t1 = t0 + Duration::from_millis(20);
+        jb.ingest_packet(p15, t1);
+        let _ = jb.pop_ready_packet(t1);
+
+        assert_eq!(jb.expected_sequence(), Some(16));
+        // Incomplete block must be pruned once expected >= 14!
+        assert!(
+            !jb.fec_blocks.contains_key(&block_id),
+            "Incomplete expired FEC block should have been pruned"
         );
     }
 }
