@@ -2,9 +2,28 @@ use async_trait::async_trait;
 use linux_quest_protocol::Packet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+pub mod adb;
+pub mod control;
+pub mod fec;
+pub mod jitter_buffer;
+pub mod pacing;
+pub mod tcp;
+pub mod udp;
+
+pub use adb::{
+    parse_devices_output, parse_reverse_list_output, AdbBridge, AdbBridgeConfig, AdbBridgeEvent,
+    AdbBridgeHandle, AdbBridgeState, AdbCommandRunner, AdbDevice, AdbDeviceState, AdbError,
+    AdbReverseRule, MockAdbRunner, SystemAdbRunner,
+};
+pub use control::{ControlChannel, ControlError, ControlMessage};
+pub use fec::{FecError, FecHeader, ReedSolomonFec, XorFec};
+pub use jitter_buffer::{AdaptiveJitterBuffer, JitterBufferConfig, JitterBufferStats};
+pub use pacing::PacketPacer;
+pub use tcp::TcpEndpoint;
+pub use udp::{PacedUdpEndpoint, DEFAULT_UDP_MTU};
 
 #[derive(Error, Debug)]
 pub enum TransportError {
@@ -19,6 +38,15 @@ pub enum TransportError {
 
     #[error("Packet too large: {size} bytes exceeds MTU {mtu}")]
     PacketTooLarge { size: usize, mtu: usize },
+
+    #[error("FEC error: {0}")]
+    Fec(#[from] fec::FecError),
+
+    #[error("ADB error: {0}")]
+    Adb(#[from] adb::AdbError),
+
+    #[error("Control channel error: {0}")]
+    Control(#[from] control::ControlError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +62,7 @@ pub struct TransportStats {
     pub packets_recv: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_recv: AtomicU64,
+    pub fec_recovered_packets: AtomicU64,
 }
 
 #[async_trait]
@@ -110,38 +139,6 @@ impl TransportEndpoint for LoopbackEndpoint {
 
     fn mode(&self) -> TransportMode {
         TransportMode::Loopback
-    }
-}
-
-/// Packet pacer to prevent packet bursts from saturating Wi-Fi buffers.
-pub struct PacketPacer {
-    rate_bytes_per_sec: u64,
-    last_send_time: std::time::Instant,
-}
-
-impl PacketPacer {
-    pub fn new(target_mbps: u32) -> Self {
-        Self {
-            rate_bytes_per_sec: (target_mbps as u64 * 1_000_000) / 8,
-            last_send_time: std::time::Instant::now(),
-        }
-    }
-
-    pub async fn pace(&mut self, packet_size_bytes: usize) {
-        if self.rate_bytes_per_sec == 0 {
-            return;
-        }
-
-        let delay_nanos = (packet_size_bytes as u64 * 1_000_000_000) / self.rate_bytes_per_sec;
-        let target_time = self.last_send_time + Duration::from_nanos(delay_nanos);
-        let now = std::time::Instant::now();
-
-        if target_time > now {
-            tokio::time::sleep(target_time - now).await;
-            self.last_send_time = target_time;
-        } else {
-            self.last_send_time = now;
-        }
     }
 }
 

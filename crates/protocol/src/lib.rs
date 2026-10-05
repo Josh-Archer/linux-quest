@@ -10,8 +10,8 @@ pub use error::ProtocolError;
 pub use handshake::{ClientHandshake, DisplayInfo, ServerHandshake};
 pub use input::{ElementState, InputEvent, MouseButton};
 pub use packet::{
-    Packet, PacketHeader, PacketType, FLAG_COMPRESSED, FLAG_INTRA_REFRESH, FLAG_KEYFRAME,
-    FLAG_LAST_CHUNK, FLAG_NONE, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION,
+    Packet, PacketHeader, PacketType, FLAG_COMPRESSED, FLAG_FEC_PROTECTED, FLAG_INTRA_REFRESH,
+    FLAG_KEYFRAME, FLAG_LAST_CHUNK, FLAG_NONE, HEADER_SIZE, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use reassembler::{AssembledFrame, FrameReassembler};
 pub use telemetry::FrameLatencyBreakdown;
@@ -201,5 +201,20 @@ mod tests {
         let total = telemetry.compute_total();
         assert_eq!(total, 9300);
         assert!((telemetry.total_ms() - 9.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_fec_parity_packet_roundtrip() {
+        let parity_payload = Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x99]);
+        let header = PacketHeader::new(PacketType::FecParity, 0, 77, 999_999, &parity_payload)
+            .with_flags(FLAG_FEC_PROTECTED);
+
+        let packet = Packet::new(header, parity_payload.clone());
+        let wire = packet.to_bytes();
+
+        let decoded = Packet::from_bytes(&wire).expect("Failed to decode FEC parity packet");
+        assert_eq!(decoded.header.packet_type, PacketType::FecParity);
+        assert_eq!(decoded.header.flags, FLAG_FEC_PROTECTED);
+        assert_eq!(decoded.payload, parity_payload);
     }
 }

@@ -175,7 +175,7 @@ mod tests {
     use linux_quest_encoder::{EncoderConfig, MockVideoEncoder};
     use linux_quest_input::MockInputInjector;
     use linux_quest_protocol::{ElementState, InputEvent, MouseButton};
-    use linux_quest_transport::LoopbackEndpoint;
+    use linux_quest_transport::{LoopbackEndpoint, PacedUdpEndpoint, TcpEndpoint};
 
     #[tokio::test]
     async fn test_host_stream_single_frame() {
@@ -243,5 +243,51 @@ mod tests {
             .expect("Handle input failed");
         assert_eq!(session.input.received_events.len(), 1);
         assert_eq!(session.input.received_events[0], input_event);
+    }
+
+    #[tokio::test]
+    async fn test_host_stream_over_tcp_endpoint() {
+        let capture = SyntheticCapture::new(0, 1280, 720, 60);
+        let encoder = MockVideoEncoder::new(EncoderConfig::default());
+        let (ep_host, mut ep_client) = TcpEndpoint::create_connected_pair().await.unwrap();
+        let input = MockInputInjector::new();
+
+        let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+        session
+            .init(EncoderConfig::default())
+            .await
+            .expect("HostStreamSession init failed");
+
+        let frame_id = session
+            .step_stream_frame()
+            .await
+            .expect("Step stream frame failed");
+        assert_eq!(frame_id, 1);
+
+        let packet = ep_client.recv_packet().await.expect("Recv failed");
+        assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
+    }
+
+    #[tokio::test]
+    async fn test_host_stream_over_paced_udp_endpoint() {
+        let capture = SyntheticCapture::new(0, 1280, 720, 60);
+        let encoder = MockVideoEncoder::new(EncoderConfig::default());
+        let (ep_host, mut ep_client) = PacedUdpEndpoint::create_connected_pair(100).await.unwrap();
+        let input = MockInputInjector::new();
+
+        let mut session = HostStreamSession::new(capture, encoder, ep_host, input, 0);
+        session
+            .init(EncoderConfig::default())
+            .await
+            .expect("HostStreamSession init failed");
+
+        let frame_id = session
+            .step_stream_frame()
+            .await
+            .expect("Step stream frame failed");
+        assert_eq!(frame_id, 1);
+
+        let packet = ep_client.recv_packet().await.expect("Recv failed");
+        assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
     }
 }

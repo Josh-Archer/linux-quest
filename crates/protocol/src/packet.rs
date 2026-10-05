@@ -13,6 +13,7 @@ pub const FLAG_KEYFRAME: u16 = 0x0001;
 pub const FLAG_LAST_CHUNK: u16 = 0x0002;
 pub const FLAG_INTRA_REFRESH: u16 = 0x0004;
 pub const FLAG_COMPRESSED: u16 = 0x0008;
+pub const FLAG_FEC_PROTECTED: u16 = 0x0010;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -27,6 +28,7 @@ pub enum PacketType {
     InputEvent = 8,
     TelemetryReport = 9,
     Disconnect = 10,
+    FecParity = 11,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -44,6 +46,7 @@ impl TryFrom<u8> for PacketType {
             8 => Ok(Self::InputEvent),
             9 => Ok(Self::TelemetryReport),
             10 => Ok(Self::Disconnect),
+            11 => Ok(Self::FecParity),
             unknown => Err(ProtocolError::InvalidPacketType(unknown)),
         }
     }
@@ -110,6 +113,15 @@ impl PacketHeader {
     pub fn with_flags(mut self, flags: u16) -> Self {
         self.flags = flags;
         self
+    }
+
+    pub fn with_fec_index(mut self, index: u16) -> Self {
+        self.reserved = index;
+        self
+    }
+
+    pub fn fec_index(&self) -> u16 {
+        self.reserved
     }
 
     pub fn encode(&self, dst: &mut BytesMut) {
