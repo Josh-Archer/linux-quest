@@ -31,6 +31,12 @@
         android:version="0x401000"
         android:required="true" />
 
+    <!-- OpenXR runtime discovery queries for Android 11+ (API 30+) package visibility -->
+    <queries>
+        <package android:name="org.khronos.openxr.runtime_broker" />
+        <package android:name="org.khronos.openxr.system_runtime" />
+    </queries>
+
     <application
         android:label="linux-quest"
         android:hasCode="false"
@@ -59,7 +65,7 @@
                 android:value="quest3|questpro" />
             <meta-data
                 android:name="com.oculus.intent.category.VR"
-                android:value="true" />
+                android:value="vr_only" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

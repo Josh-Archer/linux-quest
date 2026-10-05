@@ -26,7 +26,7 @@ pub fn android_main(app: AndroidApp) {
     }
 
     let config = ClientConfig::default();
-    let mut runtime = match QuestClientRuntime::new(config) {
+    let mut runtime = match QuestClientRuntime::new(config.clone()) {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(error = ?e, "Failed to initialize Quest client runtime");
@@ -37,39 +37,122 @@ pub fn android_main(app: AndroidApp) {
         }
     };
 
-    // Background transport packet receiver
-    let (packet_tx, packet_rx) = std::sync::mpsc::channel();
+    // Background transport packet receiver (bounded channel: 512 packets, drops on overflow)
+    let (packet_tx, packet_rx) =
+        std::sync::mpsc::sync_channel::<linux_quest_protocol::packet::Packet>(512);
     let running_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let bg_running = running_flag.clone();
+    let host_addr = config.host_addr;
+    let transport_mode = config.transport_mode;
 
-    let _receiver_handle = std::thread::spawn(move || {
-        let socket = match std::net::UdpSocket::bind("0.0.0.0:48440") {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = ?e, "Failed to bind UDP socket on 0.0.0.0:48440");
-                return;
-            }
-        };
-        let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
-        let mut buf = [0u8; 65536];
+    let receiver_handle = std::thread::spawn(move || {
+        match transport_mode {
+            crate::config::TransportMode::AdbReverseTcp => {
+                use std::io::Read;
+                let mut temp_buf = [0u8; 16384];
 
-        while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
-            match socket.recv_from(&mut buf) {
-                Ok((len, _src)) => {
-                    match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
-                        Ok(packet) => {
-                            let _ = packet_tx.send(packet);
+                while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(host = ?host_addr, "Attempting TCP connection to host for USB/ADB streaming");
+                    let stream = match std::net::TcpStream::connect_timeout(
+                        &host_addr,
+                        Duration::from_millis(1000),
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(500));
+                            continue;
                         }
-                        Err(e) => {
-                            tracing::trace!(error = ?e, "Failed to parse incoming packet");
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    let mut stream = stream;
+                    let mut read_buf = Vec::with_capacity(65536);
+
+                    while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
+                        match stream.read(&mut temp_buf) {
+                            Ok(0) => {
+                                tracing::info!("TCP streaming connection closed by host");
+                                break;
+                            }
+                            Ok(n) => {
+                                read_buf.extend_from_slice(&temp_buf[..n]);
+                                while read_buf.len() >= linux_quest_protocol::packet::HEADER_SIZE {
+                                    let mut header_slice =
+                                        &read_buf[..linux_quest_protocol::packet::HEADER_SIZE];
+                                    match linux_quest_protocol::packet::PacketHeader::decode(
+                                        &mut header_slice,
+                                    ) {
+                                        Ok(header) => {
+                                            let total_size =
+                                                linux_quest_protocol::packet::HEADER_SIZE
+                                                    + header.payload_len as usize;
+                                            if read_buf.len() >= total_size {
+                                                let pkt_bytes: Vec<u8> =
+                                                    read_buf.drain(..total_size).collect();
+                                                match linux_quest_protocol::packet::Packet::from_bytes(
+                                                    &pkt_bytes,
+                                                ) {
+                                                    Ok(packet) => {
+                                                        let _ = packet_tx.try_send(packet);
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::trace!(
+                                                            error = ?e,
+                                                            "Failed to parse incoming packet from TCP"
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // Bad header magic / corrupt byte: discard 1 byte and resynchronize
+                                            read_buf.remove(0);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(ref e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                            Err(e) => {
+                                tracing::trace!(error = ?e, "TCP stream read error");
+                                break;
+                            }
                         }
                     }
                 }
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => {
-                    tracing::trace!(error = ?e, "UDP socket recv error");
+            }
+            crate::config::TransportMode::Udp => {
+                let socket = match std::net::UdpSocket::bind("0.0.0.0:48440") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "Failed to bind UDP socket on 0.0.0.0:48440");
+                        return;
+                    }
+                };
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+                let mut buf = [0u8; 65536];
+
+                while bg_running.load(std::sync::atomic::Ordering::Relaxed) {
+                    match socket.recv_from(&mut buf) {
+                        Ok((len, _src)) => {
+                            match linux_quest_protocol::packet::Packet::from_bytes(&buf[..len]) {
+                                Ok(packet) => {
+                                    let _ = packet_tx.try_send(packet);
+                                }
+                                Err(e) => {
+                                    tracing::trace!(error = ?e, "Failed to parse incoming packet");
+                                }
+                            }
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(e) => {
+                            tracing::trace!(error = ?e, "UDP socket recv error");
+                        }
+                    }
                 }
             }
         }
@@ -78,12 +161,12 @@ pub fn android_main(app: AndroidApp) {
     let mut is_active = false;
 
     // Main Android event and render loop
-    while runtime.is_running() {
+    while runtime.is_running() && !runtime.should_exit() {
         app.poll_events(
             Some(if is_active {
                 Duration::ZERO
             } else {
-                Duration::from_millis(100)
+                Duration::from_millis(50)
             }),
             |event| {
                 if let PollEvent::Main(main_event) = event {
@@ -115,10 +198,16 @@ pub fn android_main(app: AndroidApp) {
             if let Err(e) = runtime.step_frame() {
                 tracing::warn!(error = ?e, "Error stepping client frame");
             }
+        } else {
+            // While paused, continue polling OpenXR events so state machine can transition
+            if let Err(e) = runtime.poll_events() {
+                tracing::warn!(error = ?e, "Error polling OpenXR events while paused");
+            }
         }
     }
 
     running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = receiver_handle.join();
 
     unsafe {
         ndk_context::release_android_context();

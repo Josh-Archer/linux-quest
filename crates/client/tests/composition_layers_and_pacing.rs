@@ -101,7 +101,7 @@ fn test_debug_hud_rendering_and_telemetry() {
 
     let text = hud.formatted_text();
     assert!(text.contains("90Hz"));
-    assert!(text.contains("M2P: 11.1ms"));
+    assert!(text.contains("M2P: 14.4ms"));
     assert!(text.contains("Dec: 2.8ms"));
     assert!(text.contains("c2.qti.av1.decoder.low_latency"));
     assert!(text.contains("Packets: 1500"));

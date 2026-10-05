@@ -60,7 +60,7 @@ pub fn build_quad_layer<'a, G: Graphics>(
         orientation: Quaternionf::IDENTITY,
         position: Vector3f {
             x: 0.0,
-            y: 0.0,
+            y: 1.4, // Eye level in stage space
             z: -config.distance,
         },
     };
@@ -103,7 +103,7 @@ pub fn build_cylinder_layer<'a, G: Graphics>(
         orientation: Quaternionf::IDENTITY,
         position: Vector3f {
             x: 0.0,
-            y: 0.0,
+            y: 1.4, // Eye level in stage space
             z: 0.0,
         },
     };

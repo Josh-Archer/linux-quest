@@ -105,12 +105,16 @@ impl DebugHud {
             config.target_refresh_rate
         };
 
+        let decode_ms = decoder_stats.last_latency_us as f32 / 1000.0;
+        let jitter_ms = (pacing.wait_frame_duration_us as f32 / 1000.0).min(5.0);
+        let m2p_ms = (pacing.motion_to_photon_latency_us as f32 / 1000.0) + decode_ms + jitter_ms;
+
         self.last_snapshot = HudSnapshot {
             fps,
             target_fps: config.target_refresh_rate,
-            motion_to_photon_ms: pacing.motion_to_photon_latency_us as f32 / 1000.0,
-            decode_latency_ms: decoder_stats.last_latency_us as f32 / 1000.0,
-            network_jitter_ms: (pacing.wait_frame_duration_us as f32 / 1000.0).min(5.0),
+            motion_to_photon_ms: m2p_ms,
+            decode_latency_ms: decode_ms,
+            network_jitter_ms: jitter_ms,
             decoder_name: decoder_stats.decoder_name.clone(),
             display_mode: config.display_mode,
             packets_received,
@@ -214,7 +218,7 @@ mod tests {
         hud.update(&config, &pacing, &stats, 100, 5, 0);
 
         let text = hud.formatted_text();
-        assert!(text.contains("M2P: 8.5ms"));
+        assert!(text.contains("M2P: 12.1ms"));
         assert!(text.contains("Dec: 2.4ms"));
         assert!(text.contains("c2.qti.av1"));
 

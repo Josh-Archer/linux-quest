@@ -77,6 +77,15 @@ pub trait HardwareVideoDecoder: Send {
     /// Releases a previously dequeued output buffer back to the decoder or renders it to the surface.
     fn release_output_buffer(&mut self, buffer_index: usize, render: bool) -> ClientResult<()>;
 
+    /// Releases a previously dequeued output buffer to be presented at an exact display timestamp in nanoseconds.
+    fn release_output_buffer_at_time(
+        &mut self,
+        buffer_index: usize,
+        _render_timestamp_ns: i64,
+    ) -> ClientResult<()> {
+        self.release_output_buffer(buffer_index, true)
+    }
+
     /// Flushes all pending input and output buffers (e.g. upon stream reconnect or seek).
     fn flush(&mut self) -> ClientResult<()>;
 

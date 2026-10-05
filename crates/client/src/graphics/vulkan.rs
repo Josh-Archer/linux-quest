@@ -247,12 +247,30 @@ impl VulkanContext {
         }
     }
 
-    /// Uploads and transitions an image for compositor sampling.
+    fn find_memory_type(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        type_filter: u32,
+        properties: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        let mem_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        (0..mem_properties.memory_type_count).find(|&i| {
+            (type_filter & (1 << i)) != 0
+                && (mem_properties.memory_types[i as usize].property_flags & properties)
+                    == properties
+        })
+    }
+
+    /// Uploads an RGBA pixel buffer to a swapchain image via a host-visible staging buffer.
+    ///
+    /// Respects the OpenXR Vulkan swapchain contract: transitions from
+    /// `COLOR_ATTACHMENT_OPTIMAL` -> `TRANSFER_DST_OPTIMAL` -> `COLOR_ATTACHMENT_OPTIMAL`.
     pub fn upload_rgba_to_image(
         &self,
         image: vk::Image,
-        _width: u32,
-        _height: u32,
+        width: u32,
+        height: u32,
         rgba_data: &[u8],
     ) -> ClientResult<()> {
         if self.is_simulated {
@@ -263,23 +281,111 @@ impl VulkanContext {
             .device
             .as_ref()
             .ok_or_else(|| ClientError::Vulkan("Device not loaded".into()))?;
+        let instance = self
+            .instance
+            .as_ref()
+            .ok_or_else(|| ClientError::Vulkan("Instance not loaded".into()))?;
+
+        let buffer_size = (width * height * 4) as vk::DeviceSize;
+        if rgba_data.len() < buffer_size as usize {
+            return Err(ClientError::Vulkan("Buffer too small for upload".into()));
+        }
 
         unsafe {
-            let alloc_info = vk::CommandBufferAllocateInfo::default()
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(buffer_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            let staging_buffer = device
+                .create_buffer(&buffer_info, None)
+                .map_err(|e| ClientError::Vulkan(format!("Create staging buffer failed: {e:?}")))?;
+
+            let mem_requirements = device.get_buffer_memory_requirements(staging_buffer);
+            let mem_type_index = Self::find_memory_type(
+                instance,
+                self.physical_device,
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or_else(|| {
+                device.destroy_buffer(staging_buffer, None);
+                ClientError::Vulkan("Failed to find suitable staging memory type".into())
+            })?;
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_requirements.size)
+                .memory_type_index(mem_type_index);
+
+            let staging_memory = match device.allocate_memory(&alloc_info, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    device.destroy_buffer(staging_buffer, None);
+                    return Err(ClientError::Vulkan(format!(
+                        "Allocate staging memory failed: {e:?}"
+                    )));
+                }
+            };
+
+            if let Err(e) = device.bind_buffer_memory(staging_buffer, staging_memory, 0) {
+                device.free_memory(staging_memory, None);
+                device.destroy_buffer(staging_buffer, None);
+                return Err(ClientError::Vulkan(format!(
+                    "Bind staging buffer memory failed: {e:?}"
+                )));
+            }
+
+            let data_ptr = match device.map_memory(
+                staging_memory,
+                0,
+                buffer_size,
+                vk::MemoryMapFlags::empty(),
+            ) {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    device.free_memory(staging_memory, None);
+                    device.destroy_buffer(staging_buffer, None);
+                    return Err(ClientError::Vulkan(format!(
+                        "Map staging memory failed: {e:?}"
+                    )));
+                }
+            };
+
+            std::ptr::copy_nonoverlapping(
+                rgba_data.as_ptr(),
+                data_ptr as *mut u8,
+                buffer_size as usize,
+            );
+            device.unmap_memory(staging_memory);
+
+            let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1);
 
-            let cmd = device
-                .allocate_command_buffers(&alloc_info)
-                .map_err(|e| ClientError::Vulkan(format!("Alloc cmd buffer failed: {e:?}")))?[0];
+            let cmd_buffers = match device.allocate_command_buffers(&cmd_alloc_info) {
+                Ok(b) => b,
+                Err(e) => {
+                    device.free_memory(staging_memory, None);
+                    device.destroy_buffer(staging_buffer, None);
+                    return Err(ClientError::Vulkan(format!(
+                        "Alloc cmd buffer failed: {e:?}"
+                    )));
+                }
+            };
+            let cmd = cmd_buffers[0];
 
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
-            device
-                .begin_command_buffer(cmd, &begin_info)
-                .map_err(|e| ClientError::Vulkan(format!("Begin cmd buffer failed: {e:?}")))?;
+            if let Err(e) = device.begin_command_buffer(cmd, &begin_info) {
+                device.free_command_buffers(self.command_pool, &[cmd]);
+                device.free_memory(staging_memory, None);
+                device.destroy_buffer(staging_buffer, None);
+                return Err(ClientError::Vulkan(format!(
+                    "Begin cmd buffer failed: {e:?}"
+                )));
+            }
 
             let subresource_range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -288,10 +394,11 @@ impl VulkanContext {
                 .base_array_layer(0)
                 .layer_count(1);
 
+            // OpenXR swapchain image starts in COLOR_ATTACHMENT_OPTIMAL upon wait_image
             let barrier_to_dst = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::empty())
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -300,7 +407,7 @@ impl VulkanContext {
 
             device.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -308,28 +415,40 @@ impl VulkanContext {
                 &[barrier_to_dst],
             );
 
-            let clear_color = vk::ClearColorValue {
-                float32: [
-                    rgba_data.first().copied().unwrap_or(16) as f32 / 255.0,
-                    rgba_data.get(1).copied().unwrap_or(18) as f32 / 255.0,
-                    rgba_data.get(2).copied().unwrap_or(24) as f32 / 255.0,
-                    rgba_data.get(3).copied().unwrap_or(200) as f32 / 255.0,
-                ],
-            };
+            let copy_region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
 
-            device.cmd_clear_color_image(
+            device.cmd_copy_buffer_to_image(
                 cmd,
+                staging_buffer,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear_color,
-                &[subresource_range],
+                &[copy_region],
             );
 
-            let barrier_to_read = vk::ImageMemoryBarrier::default()
+            // Transition back to COLOR_ATTACHMENT_OPTIMAL as required by OpenXR xrReleaseSwapchainImage
+            let barrier_to_color = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ
+                        | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
@@ -338,26 +457,48 @@ impl VulkanContext {
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[barrier_to_read],
+                &[barrier_to_color],
             );
 
-            device
-                .end_command_buffer(cmd)
-                .map_err(|e| ClientError::Vulkan(format!("End cmd buffer failed: {e:?}")))?;
+            if let Err(e) = device.end_command_buffer(cmd) {
+                device.free_command_buffers(self.command_pool, &[cmd]);
+                device.free_memory(staging_memory, None);
+                device.destroy_buffer(staging_buffer, None);
+                return Err(ClientError::Vulkan(format!("End cmd buffer failed: {e:?}")));
+            }
+
+            let fence_info = vk::FenceCreateInfo::default();
+            let fence = match device.create_fence(&fence_info, None) {
+                Ok(f) => f,
+                Err(e) => {
+                    device.free_command_buffers(self.command_pool, &[cmd]);
+                    device.free_memory(staging_memory, None);
+                    device.destroy_buffer(staging_buffer, None);
+                    return Err(ClientError::Vulkan(format!("Create fence failed: {e:?}")));
+                }
+            };
 
             let cmds = [cmd];
             let submit_info = vk::SubmitInfo::default().command_buffers(&cmds);
 
-            device
-                .queue_submit(self.graphics_queue, &[submit_info], vk::Fence::null())
-                .map_err(|e| ClientError::Vulkan(format!("Queue submit failed: {e:?}")))?;
+            let submit_res = device.queue_submit(self.graphics_queue, &[submit_info], fence);
+            if let Err(e) = submit_res {
+                device.destroy_fence(fence, None);
+                device.free_command_buffers(self.command_pool, &[cmd]);
+                device.free_memory(staging_memory, None);
+                device.destroy_buffer(staging_buffer, None);
+                return Err(ClientError::Vulkan(format!("Queue submit failed: {e:?}")));
+            }
 
-            let _ = device.queue_wait_idle(self.graphics_queue);
+            let _ = device.wait_for_fences(&[fence], true, 1_000_000_000);
+            device.destroy_fence(fence, None);
             device.free_command_buffers(self.command_pool, &[cmd]);
+            device.free_memory(staging_memory, None);
+            device.destroy_buffer(staging_buffer, None);
         }
 
         Ok(())

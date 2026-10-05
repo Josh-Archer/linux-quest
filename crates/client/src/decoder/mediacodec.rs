@@ -358,6 +358,45 @@ impl HardwareVideoDecoder for AndroidMediaCodecDecoder {
         Ok(())
     }
 
+    fn release_output_buffer_at_time(
+        &mut self,
+        buffer_index: usize,
+        render_timestamp_ns: i64,
+    ) -> ClientResult<()> {
+        if self.codec_ptr.is_null() {
+            return Err(ClientError::Decoder(
+                "AMediaCodec not initialized".to_string(),
+            ));
+        }
+
+        // Only render to surface if an ANativeWindow was actually attached
+        if self.surface_window_ptr.is_null() {
+            return self.release_output_buffer(buffer_index, false);
+        }
+
+        let status = unsafe {
+            ndk_sys::AMediaCodec_releaseOutputBufferAtTime(
+                self.codec_ptr,
+                buffer_index,
+                render_timestamp_ns,
+            )
+        };
+
+        if status.0 != 0 {
+            // Attempt emergency release without rendering to avoid permanently leaking the output buffer slot
+            unsafe {
+                let _ =
+                    ndk_sys::AMediaCodec_releaseOutputBuffer(self.codec_ptr, buffer_index, false);
+            }
+            return Err(ClientError::Decoder(format!(
+                "AMediaCodec_releaseOutputBufferAtTime failed with status {status:?}"
+            )));
+        }
+
+        self.stats.frames_rendered += 1;
+        Ok(())
+    }
+
     fn flush(&mut self) -> ClientResult<()> {
         self.enqueue_timestamps.clear();
         if !self.codec_ptr.is_null() {

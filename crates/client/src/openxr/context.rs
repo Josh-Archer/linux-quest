@@ -37,6 +37,9 @@ pub struct OpenXrContext {
     session_state: SessionState,
     session_running: Arc<AtomicBool>,
     supports_cylinder: bool,
+    desktop_swapchain_is_surface: bool,
+    supports_layer_settings: bool,
+    should_exit: Arc<AtomicBool>,
     is_simulated: bool,
 }
 
@@ -63,6 +66,9 @@ impl OpenXrContext {
             session_state: SessionState::FOCUSED,
             session_running: Arc::new(AtomicBool::new(true)),
             supports_cylinder: true,
+            desktop_swapchain_is_surface: false,
+            supports_layer_settings: false,
+            should_exit: Arc::new(AtomicBool::new(false)),
             is_simulated: true,
         }
     }
@@ -301,7 +307,9 @@ impl OpenXrContext {
 
         // Create initial swapchains
         #[cfg(target_os = "android")]
-        let (desktop_swapchain, surface_window) = if available_exts.khr_android_surface_swapchain {
+        let (desktop_swapchain, surface_window, desktop_swapchain_is_surface) = if available_exts
+            .khr_android_surface_swapchain
+        {
             let pfn = unsafe {
                 openxr::raw::AndroidSurfaceSwapchainKHR::load(&entry, instance.as_raw()).map_err(
                     |e| {
@@ -367,7 +375,7 @@ impl OpenXrContext {
             };
             let sc =
                 unsafe { openxr::Swapchain::<Vulkan>::from_raw(session.clone(), raw_swapchain) };
-            (Some(sc), native_window)
+            (Some(sc), native_window, true)
         } else {
             let desktop_info = SwapchainCreateInfo {
                 create_flags: SwapchainCreateFlags::EMPTY,
@@ -383,11 +391,11 @@ impl OpenXrContext {
             let sc = session.create_swapchain(&desktop_info).map_err(|e| {
                 ClientError::OpenXr(format!("Failed to create desktop swapchain: {e:?}"))
             })?;
-            (Some(sc), None)
+            (Some(sc), None, false)
         };
 
         #[cfg(not(target_os = "android"))]
-        let desktop_swapchain = {
+        let (desktop_swapchain, desktop_swapchain_is_surface) = {
             let desktop_info = SwapchainCreateInfo {
                 create_flags: SwapchainCreateFlags::EMPTY,
                 usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,
@@ -402,12 +410,14 @@ impl OpenXrContext {
             let sc = session.create_swapchain(&desktop_info).map_err(|e| {
                 ClientError::OpenXr(format!("Failed to create desktop swapchain: {e:?}"))
             })?;
-            Some(sc)
+            (Some(sc), false)
         };
 
         let hud_info = SwapchainCreateInfo {
             create_flags: SwapchainCreateFlags::EMPTY,
-            usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::SAMPLED,
+            usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT
+                | SwapchainUsageFlags::SAMPLED
+                | SwapchainUsageFlags::TRANSFER_DST,
             format: vk::Format::R8G8B8A8_UNORM.as_raw() as u32,
             sample_count: 1,
             width: 512,
@@ -446,6 +456,9 @@ impl OpenXrContext {
             session_state: SessionState::IDLE,
             session_running: Arc::new(AtomicBool::new(false)),
             supports_cylinder,
+            desktop_swapchain_is_surface,
+            supports_layer_settings: available_exts.fb_composition_layer_settings,
+            should_exit: Arc::new(AtomicBool::new(false)),
             is_simulated: false,
         })
     }
@@ -489,6 +502,11 @@ impl OpenXrContext {
     /// Whether the session is actively running.
     pub fn is_session_running(&self) -> bool {
         self.session_running.load(Ordering::SeqCst)
+    }
+
+    /// Whether the OpenXR session has received an EXITING or LOSS_PENDING event.
+    pub fn should_exit(&self) -> bool {
+        self.should_exit.load(Ordering::SeqCst)
     }
 
     /// Returns the active refresh rate manager.
@@ -547,6 +565,7 @@ impl OpenXrContext {
                         }
                         SessionState::EXITING | SessionState::LOSS_PENDING => {
                             self.session_running.store(false, Ordering::SeqCst);
+                            self.should_exit.store(true, Ordering::SeqCst);
                         }
                         _ => {}
                     }
@@ -695,9 +714,14 @@ impl OpenXrContext {
         let stream_height = config.stream_height;
 
         if let (Some(space), Some(desktop_sc)) = (&self.stage_space, &mut self.desktop_swapchain) {
-            let _ = desktop_sc.acquire_image();
-            let _ = desktop_sc.wait_image(openxr::Duration::INFINITE);
-            let _ = desktop_sc.release_image();
+            // Under XR_KHR_android_surface_swapchain, AMediaCodec is the producer.
+            // Calling xrAcquireSwapchainImage/xrWaitSwapchainImage/xrReleaseSwapchainImage on a surface
+            // swapchain is forbidden by the OpenXR specification and causes compositor faults.
+            if !self.desktop_swapchain_is_surface {
+                let _ = desktop_sc.acquire_image();
+                let _ = desktop_sc.wait_image(openxr::Duration::INFINITE);
+                let _ = desktop_sc.release_image();
+            }
 
             let desktop_cfg = crate::openxr::layers::DesktopLayerConfig {
                 mode: config.display_mode,
@@ -714,6 +738,13 @@ impl OpenXrContext {
                 .ok_or_else(|| ClientError::OpenXr("Frame stream not initialized".into()))?;
             let mut stream = stream_mutex.lock();
 
+            let layer_settings = openxr::sys::CompositionLayerSettingsFB {
+                ty: openxr::sys::StructureType::COMPOSITION_LAYER_SETTINGS_FB,
+                next: std::ptr::null(),
+                layer_flags: openxr::sys::CompositionLayerSettingsFlagsFB::QUALITY_SUPER_SAMPLING
+                    | openxr::sys::CompositionLayerSettingsFlagsFB::QUALITY_SHARPENING,
+            };
+
             if self.supports_cylinder
                 && config.display_mode == crate::config::DisplayMode::CurvedCylinder
             {
@@ -724,6 +755,14 @@ impl OpenXrContext {
                     stream_height,
                     &desktop_cfg,
                 );
+                let cyl_layer = if self.supports_layer_settings {
+                    let mut raw = cyl_layer.into_raw();
+                    raw.next = &layer_settings as *const _ as *const std::ffi::c_void;
+                    unsafe { openxr::CompositionLayerCylinderKHR::from_raw(raw) }
+                } else {
+                    cyl_layer
+                };
+
                 if config.enable_hud {
                     if let (Some(view_space), Some(hud_sc)) =
                         (&self.view_space, &mut self.hud_swapchain)
@@ -741,17 +780,22 @@ impl OpenXrContext {
                         }
                         let hud_layer =
                             crate::openxr::layers::build_hud_layer(view_space, hud_sc, 512, 256);
-                        let _ = stream.end(
-                            display_time,
-                            EnvironmentBlendMode::OPAQUE,
-                            &[&cyl_layer, &hud_layer],
-                        );
+                        stream
+                            .end(
+                                display_time,
+                                EnvironmentBlendMode::OPAQUE,
+                                &[&cyl_layer, &hud_layer],
+                            )
+                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                     } else {
-                        let _ =
-                            stream.end(display_time, EnvironmentBlendMode::OPAQUE, &[&cyl_layer]);
+                        stream
+                            .end(display_time, EnvironmentBlendMode::OPAQUE, &[&cyl_layer])
+                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                     }
                 } else {
-                    let _ = stream.end(display_time, EnvironmentBlendMode::OPAQUE, &[&cyl_layer]);
+                    stream
+                        .end(display_time, EnvironmentBlendMode::OPAQUE, &[&cyl_layer])
+                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                 }
             } else {
                 let quad_layer = crate::openxr::layers::build_quad_layer(
@@ -761,6 +805,14 @@ impl OpenXrContext {
                     stream_height,
                     &desktop_cfg,
                 );
+                let quad_layer = if self.supports_layer_settings {
+                    let mut raw = quad_layer.into_raw();
+                    raw.next = &layer_settings as *const _ as *const std::ffi::c_void;
+                    unsafe { openxr::CompositionLayerQuad::from_raw(raw) }
+                } else {
+                    quad_layer
+                };
+
                 if config.enable_hud {
                     if let (Some(view_space), Some(hud_sc)) =
                         (&self.view_space, &mut self.hud_swapchain)
@@ -778,22 +830,29 @@ impl OpenXrContext {
                         }
                         let hud_layer =
                             crate::openxr::layers::build_hud_layer(view_space, hud_sc, 512, 256);
-                        let _ = stream.end(
-                            display_time,
-                            EnvironmentBlendMode::OPAQUE,
-                            &[&quad_layer, &hud_layer],
-                        );
+                        stream
+                            .end(
+                                display_time,
+                                EnvironmentBlendMode::OPAQUE,
+                                &[&quad_layer, &hud_layer],
+                            )
+                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                     } else {
-                        let _ =
-                            stream.end(display_time, EnvironmentBlendMode::OPAQUE, &[&quad_layer]);
+                        stream
+                            .end(display_time, EnvironmentBlendMode::OPAQUE, &[&quad_layer])
+                            .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                     }
                 } else {
-                    let _ = stream.end(display_time, EnvironmentBlendMode::OPAQUE, &[&quad_layer]);
+                    stream
+                        .end(display_time, EnvironmentBlendMode::OPAQUE, &[&quad_layer])
+                        .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
                 }
             }
         } else if let Some(stream_mutex) = &self.frame_stream {
             let mut stream = stream_mutex.lock();
-            let _ = stream.end(display_time, EnvironmentBlendMode::OPAQUE, &[]);
+            stream
+                .end(display_time, EnvironmentBlendMode::OPAQUE, &[])
+                .map_err(|e| ClientError::OpenXr(format!("end_frame failed: {e:?}")))?;
         }
 
         Ok(())

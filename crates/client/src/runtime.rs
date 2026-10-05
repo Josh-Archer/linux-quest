@@ -15,9 +15,9 @@ use crate::receiver::ClientReceiver;
 /// High-performance client runtime managing the VR spatial desktop session.
 pub struct QuestClientRuntime {
     config: ClientConfig,
+    decoder: Box<dyn HardwareVideoDecoder>,
     openxr_context: OpenXrContext,
     vulkan_context: VulkanContext,
-    decoder: Box<dyn HardwareVideoDecoder>,
     receiver: ClientReceiver,
     frame_loop: FrameLoopEngine,
     hud: DebugHud,
@@ -35,20 +35,28 @@ impl QuestClientRuntime {
         let openxr_context = match OpenXrContext::try_new(&config, &mut vulkan_context) {
             Ok(ctx) => ctx,
             Err(e) => {
+                #[cfg(target_os = "android")]
+                if !config.force_mock_decoder {
+                    return Err(e);
+                }
                 tracing::info!(error = ?e, "Using simulated OpenXR context");
                 OpenXrContext::new_simulated(&config)
             }
         };
 
-        #[allow(unused_mut)]
-        let mut decoder = create_decoder(&config, config.stream_width, config.stream_height);
         #[cfg(target_os = "android")]
-        if let Some(win) = openxr_context.surface_window() {
-            unsafe {
-                let _ = decoder.set_surface_window(win.ptr().as_ptr() as *mut std::ffi::c_void);
-            }
-            let _ = decoder.init(config.stream_width, config.stream_height, config.codec);
-        }
+        let surface_ptr = openxr_context
+            .surface_window()
+            .map(|win| win.ptr().as_ptr() as *mut std::ffi::c_void);
+        #[cfg(not(target_os = "android"))]
+        let surface_ptr = None;
+
+        let decoder = create_decoder(
+            &config,
+            config.stream_width,
+            config.stream_height,
+            surface_ptr,
+        )?;
 
         let receiver = ClientReceiver::new(&config);
         let frame_loop = FrameLoopEngine::new();
@@ -56,9 +64,9 @@ impl QuestClientRuntime {
 
         Ok(Self {
             config,
+            decoder,
             openxr_context,
             vulkan_context,
-            decoder,
             receiver,
             frame_loop,
             hud,
@@ -118,7 +126,9 @@ impl QuestClientRuntime {
 
         // 4. Dequeue and release hardware-decoded video frames direct to OpenXR surface
         while let Ok(Some(frame)) = self.decoder.dequeue_output_buffer(0) {
-            let _ = self.decoder.release_output_buffer(frame.buffer_index, true);
+            let _ = self
+                .decoder
+                .release_output_buffer_at_time(frame.buffer_index, pacing.predicted_display_time);
         }
 
         // 5. Update debug HUD telemetry
@@ -193,6 +203,16 @@ impl QuestClientRuntime {
     /// Returns a reference to the Vulkan context.
     pub fn vulkan_context(&self) -> &VulkanContext {
         &self.vulkan_context
+    }
+
+    /// Polls OpenXR runtime events and updates the session state machine.
+    pub fn poll_events(&mut self) -> ClientResult<()> {
+        self.openxr_context.poll_events()
+    }
+
+    /// Whether the client runtime or OpenXR session has requested termination.
+    pub fn should_exit(&self) -> bool {
+        !self.is_running || self.openxr_context.should_exit()
     }
 
     /// Signals the runtime to gracefully shut down.
