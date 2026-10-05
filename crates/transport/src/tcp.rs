@@ -69,12 +69,16 @@ impl TcpEndpoint {
                     &mut actual_rcv as *mut _ as *mut libc::c_void,
                     &mut rcv_len,
                 ) == 0
-                    && actual_rcv < buf_size
                 {
-                    tracing::debug!(
-                        "Kernel granted SO_RCVBUF of {} bytes (clamped by net.core.rmem_max)",
-                        actual_rcv
-                    );
+                    // Linux doubles the requested socket buffer size for internal bookkeeping and returns the doubled value
+                    let granted_rcv = actual_rcv / 2;
+                    if granted_rcv < buf_size {
+                        tracing::debug!(
+                            "Kernel granted SO_RCVBUF of {} bytes (clamped from requested {} by net.core.rmem_max)",
+                            granted_rcv,
+                            buf_size
+                        );
+                    }
                 }
 
                 let mut actual_snd: libc::c_int = 0;
@@ -86,12 +90,16 @@ impl TcpEndpoint {
                     &mut actual_snd as *mut _ as *mut libc::c_void,
                     &mut snd_len,
                 ) == 0
-                    && actual_snd < buf_size
                 {
-                    tracing::debug!(
-                        "Kernel granted SO_SNDBUF of {} bytes (clamped by net.core.wmem_max)",
-                        actual_snd
-                    );
+                    // Linux doubles the requested socket buffer size for internal bookkeeping and returns the doubled value
+                    let granted_snd = actual_snd / 2;
+                    if granted_snd < buf_size {
+                        tracing::debug!(
+                            "Kernel granted SO_SNDBUF of {} bytes (clamped from requested {} by net.core.wmem_max)",
+                            granted_snd,
+                            buf_size
+                        );
+                    }
                 }
             }
         }

@@ -38,12 +38,13 @@ impl PacketPacer {
         }
 
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_send_time);
+        let mut elapsed = now.duration_since(self.last_send_time);
 
         // Reset on large gaps (> 1 second) to prevent token arithmetic overflow and ensure freshness
         if elapsed > Duration::from_secs(1) {
             self.accumulated_bytes = 0;
             self.last_send_time = now;
+            elapsed = Duration::ZERO;
         }
 
         let elapsed_nanos = elapsed.as_nanos();

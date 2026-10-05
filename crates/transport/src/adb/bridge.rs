@@ -16,6 +16,7 @@ pub enum AdbBridgeState {
     },
     Reconnecting {
         serial: String,
+        model: Option<String>,
         attempts: usize,
     },
 }
@@ -137,7 +138,7 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                 Ok(None)
             }
 
-            AdbBridgeState::Connected { serial, .. } => {
+            AdbBridgeState::Connected { serial, model } => {
                 let connected = match self.runner.check_connection(Some(serial)).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -150,6 +151,7 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                     // Device disconnected or connection check failed; begin reconnection
                     self.state = AdbBridgeState::Reconnecting {
                         serial: serial.clone(),
+                        model: model.clone(),
                         attempts: 1,
                     };
                     let evt = AdbBridgeEvent::CableBumpDetected {
@@ -183,6 +185,7 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                         tracing::warn!("Failed to re-apply reverse port forwarding rule: {e}");
                         self.state = AdbBridgeState::Reconnecting {
                             serial: serial.clone(),
+                            model: model.clone(),
                             attempts: 1,
                         };
                         let evt = AdbBridgeEvent::Error(e.to_string());
@@ -194,7 +197,11 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                 Ok(None)
             }
 
-            AdbBridgeState::Reconnecting { serial, attempts } => {
+            AdbBridgeState::Reconnecting {
+                serial,
+                model,
+                attempts,
+            } => {
                 let connected = self
                     .runner
                     .check_connection(Some(serial))
@@ -215,7 +222,7 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                     {
                         self.state = AdbBridgeState::Connected {
                             serial: serial.clone(),
-                            model: None,
+                            model: model.clone(),
                         };
                         let evt = AdbBridgeEvent::ReconnectionSuccessful {
                             serial: serial.clone(),
@@ -235,6 +242,7 @@ impl<R: AdbCommandRunner> AdbBridge<R> {
                 } else {
                     self.state = AdbBridgeState::Reconnecting {
                         serial: serial.clone(),
+                        model: model.clone(),
                         attempts: attempts + 1,
                     };
                 }
@@ -380,7 +388,13 @@ mod tests {
                 serial: "QUEST3_ABC".to_string(),
             }
         );
-        assert!(matches!(bridge.state(), AdbBridgeState::Connected { .. }));
+        assert_eq!(
+            bridge.state(),
+            &AdbBridgeState::Connected {
+                serial: "QUEST3_ABC".to_string(),
+                model: Some("Quest_3".to_string()),
+            }
+        );
     }
 
     #[tokio::test]

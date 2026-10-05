@@ -59,6 +59,7 @@ struct FecBlockTracker {
     scheme: FecScheme,
     k: usize,
     m: usize,
+    base_sequence: Option<u32>,
     first_arrival: Instant,
     sources: HashMap<usize, (u32, Packet)>, // index_in_block -> (seq, Packet)
     parities: HashMap<usize, Bytes>,        // parity_index -> raw_bytes
@@ -167,6 +168,7 @@ impl AdaptiveJitterBuffer {
                         scheme: fec_header.scheme,
                         k: fec_header.source_count as usize,
                         m: fec_header.parity_count as usize,
+                        base_sequence: None,
                         first_arrival: now,
                         sources: HashMap::new(),
                         parities: HashMap::new(),
@@ -231,6 +233,7 @@ impl AdaptiveJitterBuffer {
                     scheme: FecScheme::ReedSolomon,
                     k: 0,
                     m: 0,
+                    base_sequence: None,
                     first_arrival: now,
                     sources: HashMap::new(),
                     parities: HashMap::new(),
@@ -243,8 +246,23 @@ impl AdaptiveJitterBuffer {
                 idx < MAX_FEC_K && tracker.sources.len() < MAX_FEC_K
             };
             if valid_idx {
-                tracker.sources.insert(idx, (seq, packet.clone()));
-                self.try_fec_recovery(block_id, now);
+                let implied_base = seq.saturating_sub(idx as u32);
+                let consistent = match tracker.base_sequence {
+                    None => {
+                        tracker.base_sequence = Some(implied_base);
+                        true
+                    }
+                    Some(b) => b == implied_base,
+                };
+                if consistent {
+                    tracker.sources.insert(idx, (seq, packet.clone()));
+                    self.try_fec_recovery(block_id, now);
+                } else {
+                    tracing::warn!(
+                        "Inconsistent FEC (seq, index) in block {}: seq={}, idx={}, expected_base={:?}",
+                        block_id, seq, idx, tracker.base_sequence
+                    );
+                }
             }
         }
 
@@ -280,6 +298,7 @@ impl AdaptiveJitterBuffer {
                 scheme,
                 k,
                 m,
+                base_sequence: None,
                 first_arrival: Instant::now(),
                 sources: HashMap::new(),
                 parities: HashMap::new(),
@@ -333,9 +352,12 @@ impl AdaptiveJitterBuffer {
 
         if let Ok(all_sources) = recovered {
             let ref_arrival = tracker.first_arrival;
+            let base_seq = match tracker.base_sequence {
+                Some(b) => b,
+                None => return false,
+            };
             let ref_entry = tracker.sources.values().next();
-            if let Some((ref_seq, ref_pkt)) = ref_entry {
-                let base_seq = ref_seq.saturating_sub(ref_pkt.header.fec_index() as u32);
+            if let Some((_ref_seq, ref_pkt)) = ref_entry {
                 let packet_type = ref_pkt.header.packet_type;
                 let stream_id = ref_pkt.header.stream_id;
                 let timestamp_us = ref_pkt.header.timestamp_us;
@@ -344,24 +366,33 @@ impl AdaptiveJitterBuffer {
                     if let std::collections::hash_map::Entry::Vacant(e) = tracker.sources.entry(idx)
                     {
                         let seq = base_seq.saturating_add(idx as u32);
-                        let rec_header =
-                            PacketHeader::new(packet_type, stream_id, seq, timestamp_us, &payload)
-                                .with_flags(FLAG_FEC_PROTECTED)
-                                .with_fec_index(idx as u16);
+                        if !self.queue.contains_key(&seq) {
+                            let rec_header = PacketHeader::new(
+                                packet_type,
+                                stream_id,
+                                seq,
+                                timestamp_us,
+                                &payload,
+                            )
+                            .with_flags(FLAG_FEC_PROTECTED)
+                            .with_fec_index(idx as u16);
 
-                        let recovered_packet = Packet::new(rec_header, payload);
-                        self.queue.insert(
-                            recovered_packet.header.sequence,
-                            QueuedPacket {
-                                packet: recovered_packet.clone(),
-                                arrival_instant: ref_arrival,
-                            },
-                        );
-                        e.insert((recovered_packet.header.sequence, recovered_packet));
-                        self.stats.packets_reconstructed_fec += 1;
+                            let recovered_packet = Packet::new(rec_header, payload);
+                            self.queue.insert(
+                                recovered_packet.header.sequence,
+                                QueuedPacket {
+                                    packet: recovered_packet.clone(),
+                                    arrival_instant: ref_arrival,
+                                },
+                            );
+                            e.insert((recovered_packet.header.sequence, recovered_packet));
+                            self.stats.packets_reconstructed_fec += 1;
+                        }
                     }
                 }
                 self.fec_blocks.remove(&block_id);
+                // Cap queue depth after inserting recovered packets
+                self.evict_stale(self.config.max_queue_depth);
                 return true;
             }
         }
@@ -370,28 +401,29 @@ impl AdaptiveJitterBuffer {
     }
 
     /// Checks whether a missing sequence number belongs to an active, incomplete FEC block
-    /// that can still be reconstructed (i.e. remaining missing packets <= M).
+    /// that can still be reconstructed (i.e. K > 0, M > 0, remaining missing packets <= M).
     pub fn is_sequence_fec_recoverable(&self, missing_seq: u32) -> bool {
         for tracker in self.fec_blocks.values() {
-            if tracker.sources.is_empty() {
-                continue;
-            }
-            let (&ref_idx, (ref_seq, _)) = tracker.sources.iter().next().unwrap();
-            let base_seq = ref_seq.saturating_sub(ref_idx as u32);
             let k = tracker.k;
             let m = tracker.m;
-            if k > 0 {
-                if missing_seq >= base_seq && missing_seq < base_seq + (k as u32) {
-                    let missing_idx = (missing_seq - base_seq) as usize;
-                    if !tracker.sources.contains_key(&missing_idx) {
-                        let missing_count = k.saturating_sub(tracker.sources.len());
-                        if missing_count > 0 && (m == 0 || missing_count <= m) {
-                            return true;
-                        }
+            // Playout should only hold if block dimensions are known and parity is configured
+            if k == 0 || m == 0 {
+                continue;
+            }
+
+            let base_seq = match tracker.base_sequence {
+                Some(b) => b,
+                None => continue,
+            };
+
+            if missing_seq >= base_seq && missing_seq < base_seq + (k as u32) {
+                let missing_idx = (missing_seq - base_seq) as usize;
+                if !tracker.sources.contains_key(&missing_idx) {
+                    let missing_count = k.saturating_sub(tracker.sources.len());
+                    if missing_count > 0 && missing_count <= m {
+                        return true;
                     }
                 }
-            } else if missing_seq >= base_seq && missing_seq < base_seq + (MAX_FEC_K as u32) {
-                return true;
             }
         }
         false
@@ -446,7 +478,14 @@ impl AdaptiveJitterBuffer {
         while self.queue.len() > max_depth {
             if let Some((&first_seq, _)) = self.queue.iter().next() {
                 self.queue.remove(&first_seq);
-                self.stats.packets_lost += 1;
+                if let Some(expected) = self.expected_sequence {
+                    if first_seq >= expected {
+                        self.stats.packets_lost += (first_seq - expected) as u64 + 1;
+                        self.expected_sequence = Some(first_seq.saturating_add(1));
+                    }
+                } else {
+                    self.stats.packets_lost += 1;
+                }
             } else {
                 break;
             }
@@ -804,5 +843,209 @@ mod tests {
         if let Some(tracker) = jb.fec_blocks.get(&9999) {
             assert!(!tracker.sources.contains_key(&300));
         }
+    }
+
+    #[test]
+    fn test_jitter_buffer_m_zero_does_not_hold_playout() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+        let block_id = 12345;
+
+        // Block with zero parity (m = 0) can never be reconstructed
+        jb.register_fec_block(block_id, 3, 0);
+
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, b"chunk0")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            Bytes::from_static(b"chunk0"),
+        );
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 12, block_id, b"chunk2")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(2),
+            Bytes::from_static(b"chunk2"),
+        );
+        jb.ingest_packet(p0, now);
+        jb.ingest_packet(p2, now);
+
+        // Sequence 11 is missing, but with m == 0 it should not hold playout
+        assert!(
+            !jb.is_sequence_fec_recoverable(11),
+            "Sequence should not be recoverable when m == 0"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_unknown_k_does_not_hold_playout() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+        let block_id = 54321;
+
+        // Media packet arrives with FEC_PROTECTED before any parity or register_fec_block (k == 0)
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, b"chunk0")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            Bytes::from_static(b"chunk0"),
+        );
+        jb.ingest_packet(p0, now);
+
+        // With k == 0 (dimensions unknown), playout should not hold
+        assert!(
+            !jb.is_sequence_fec_recoverable(11),
+            "Sequence should not be recoverable when k is unknown"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_fec_recovery_respects_max_queue_depth() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            max_queue_depth: 4,
+            ..Default::default()
+        });
+        let now = Instant::now();
+        let block_id = 8888;
+
+        let s0 = Bytes::from_static(b"source-0");
+        let s1 = Bytes::from_static(b"source-1");
+        let s2 = Bytes::from_static(b"source-2");
+
+        let sources = vec![s0.clone(), s1.clone(), s2.clone()];
+        let parities = ReedSolomonFec::encode(block_id, &sources, 1).unwrap();
+        jb.register_fec_block(block_id, 3, 1);
+
+        // Ingest source 0 and 2 (source 1 missing)
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 10, block_id, &s0)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s0,
+        );
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 12, block_id, &s2)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(2),
+            s2,
+        );
+        jb.ingest_packet(p0, now);
+        jb.ingest_packet(p2, now);
+
+        // Ingest 2 more independent packets to fill queue to max depth 4
+        let p_extra1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 13, 9001, b"extra1"),
+            Bytes::from_static(b"extra1"),
+        );
+        let p_extra2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 14, 9002, b"extra2"),
+            Bytes::from_static(b"extra2"),
+        );
+        jb.ingest_packet(p_extra1, now);
+        jb.ingest_packet(p_extra2, now);
+        assert_eq!(jb.queue_len(), 4);
+
+        // Now parity arrives and triggers recovery of source 1 (seq 11)
+        let parity_pkt = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 20, block_id, &parities[0]),
+            parities[0].clone(),
+        );
+        jb.ingest_packet(parity_pkt, now);
+
+        // FEC recovery should have occurred
+        assert_eq!(jb.stats().packets_reconstructed_fec, 1);
+        // Queue length MUST be clamped to max_queue_depth
+        assert!(
+            jb.queue_len() <= 4,
+            "Queue length {} should not exceed max_queue_depth 4",
+            jb.queue_len()
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_eviction_advances_expected_sequence_without_double_counting() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            max_queue_depth: 3,
+            min_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Default::default()
+        });
+        let now = Instant::now();
+
+        // Ingest packets 1 and 2
+        let p1 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, 1000, b"data1"),
+            Bytes::from_static(b"data1"),
+        );
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 2, 1000, b"data2"),
+            Bytes::from_static(b"data2"),
+        );
+        jb.ingest_packet(p1, now);
+        jb.ingest_packet(p2, now);
+
+        // Pop packet 1 -> expected_sequence is initialized to Some(2)
+        let popped_1 = jb.pop_ready_packet(now).expect("Packet 1 ready");
+        assert_eq!(popped_1.header.sequence, 1);
+        assert_eq!(jb.expected_sequence, Some(2));
+        assert_eq!(jb.stats().packets_lost, 0);
+
+        // Now burst of packets arrives: 5, 6, 7, 8 (packets 2, 3, 4 are lost in transit)
+        for seq in 5..=8 {
+            let p = Packet::new(
+                PacketHeader::new(PacketType::VideoFrameChunk, 0, seq, 1000, b"data"),
+                Bytes::from_static(b"data"),
+            );
+            jb.ingest_packet(p, now);
+        }
+
+        // With max_queue_depth = 3, packets should be clamped
+        assert!(jb.queue_len() <= 3);
+
+        // Now pop the next ready packet from queue (which will be seq 6 or later after eviction)
+        let popped_next = jb.pop_ready_packet(now).expect("Next packet ready");
+        let popped_seq = popped_next.header.sequence;
+
+        // Total delivered: packet 1 + popped_next
+        assert_eq!(jb.stats().packets_delivered, 2);
+        // Total packets up to popped_seq was popped_seq.
+        // Packets lost + packets delivered should equal popped_seq! (No double counting)
+        assert_eq!(
+            jb.stats().packets_lost + jb.stats().packets_delivered,
+            popped_seq as u64,
+            "Gaps must be counted exactly once without double counting between eviction and playout"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_inconsistent_fec_index_rejected() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+        let block_id = 424242;
+
+        jb.register_fec_block(block_id, 4, 1);
+
+        // First packet establishes base_sequence: seq 100 with fec_index 0 -> base = 100
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 100, block_id, b"s0")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            Bytes::from_static(b"s0"),
+        );
+        jb.ingest_packet(p0, now);
+
+        // Inconsistent packet: seq 200 with fec_index 1 -> implied base = 199 != 100
+        let p_inconsistent = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 200, block_id, b"s1_bad")
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(1),
+            Bytes::from_static(b"s1_bad"),
+        );
+        jb.ingest_packet(p_inconsistent, now);
+
+        let tracker = jb.fec_blocks.get(&block_id).expect("Tracker exists");
+        assert_eq!(tracker.base_sequence, Some(100));
+        assert!(tracker.sources.contains_key(&0));
+        // Index 1 with inconsistent base must be rejected from tracker.sources
+        assert!(!tracker.sources.contains_key(&1));
     }
 }

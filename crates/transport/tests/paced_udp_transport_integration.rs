@@ -59,8 +59,8 @@ async fn test_paced_udp_pacing_rate_limiting() {
         PacedUdpEndpoint::create_connected_pair(50).await.unwrap();
 
     // 50 Mbps = 6.25 MB/s
-    // Send 10 packets of 1250 bytes = 12,500 bytes = 100,000 bits.
-    // At 50 Mbps, transmission should take ~2ms.
+    // Send 10 packets of 1282 wire bytes (32-byte header + 1250-byte payload) = 12,820 bytes = 102,560 bits.
+    // With 2800-byte burst allowance, net paced bytes = 10,020 bytes, taking ~1.60ms at 50 Mbps (6.25 MB/s).
     let packet_count = 10;
     let payload = Bytes::from(vec![0x33; 1250]);
 
@@ -91,8 +91,9 @@ async fn test_paced_udp_pacing_rate_limiting() {
     tokio::try_join!(sender, receiver).unwrap();
     let elapsed = start.elapsed();
 
-    // 10 packets of 1232 bytes at 50 Mbps = 1.97ms theoretical pacing time.
-    // Assert tighter bounds: at least 1.5ms (>75% of paced time) and under 50ms.
+    // 10 packets of 1282 bytes wire (32-byte header + 1250-byte payload) = 12,820 bytes.
+    // With 2800-byte burst allowance, net paced bytes = 10,020 bytes, taking ~1.60ms at 50 Mbps (6.25 MB/s).
+    // Assert tighter bounds: at least 1.5ms and under 50ms.
     assert!(
         elapsed.as_micros() >= 1500,
         "Pacing should take at least 1.5ms, got {:?}",
