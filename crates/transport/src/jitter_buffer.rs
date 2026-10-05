@@ -60,6 +60,7 @@ struct FecBlockTracker {
     k: usize,
     m: usize,
     base_sequence: Option<u32>,
+    unwrapped_base_seq: Option<u64>,
     first_arrival: Instant,
     sources: HashMap<usize, (u32, Packet)>, // index_in_block -> (seq, Packet)
     parities: HashMap<usize, Bytes>,        // parity_index -> raw_bytes
@@ -83,6 +84,11 @@ impl FecBlockTracker {
     }
 }
 
+/// Base offset used for continuous 64-bit sequence number unwrapping.
+/// Starts at 2^32 so that differences backwards from the initial sequence
+/// can never underflow u64 even under severe packet reordering.
+const SEQUENCE_EPOCH_OFFSET: u64 = 1u64 << 32;
+
 /// Maximum number of active FEC blocks tracked simultaneously in memory.
 pub const MAX_FEC_BLOCKS: usize = 64;
 
@@ -96,9 +102,10 @@ pub struct AdaptiveJitterBuffer {
     smoothed_rtt_us: f64,
     last_arrival_instant: Option<Instant>,
     last_sender_timestamp_us: Option<u64>,
-    expected_sequence: Option<u32>,
+    highest_seen_unwrapped: Option<u64>,
+    expected_unwrapped: Option<u64>,
 
-    queue: BTreeMap<u32, QueuedPacket>,
+    queue: BTreeMap<u64, QueuedPacket>,
     fec_blocks: HashMap<u64, FecBlockTracker>,
 
     stats: JitterBufferStats,
@@ -112,10 +119,42 @@ impl AdaptiveJitterBuffer {
             smoothed_rtt_us: 0.0,
             last_arrival_instant: None,
             last_sender_timestamp_us: None,
-            expected_sequence: None,
+            highest_seen_unwrapped: None,
+            expected_unwrapped: None,
             queue: BTreeMap::new(),
             fec_blocks: HashMap::new(),
             stats: JitterBufferStats::default(),
+        }
+    }
+
+    /// Returns the currently expected 32-bit sequence number (cursor), if initialized.
+    pub fn expected_sequence(&self) -> Option<u32> {
+        self.expected_unwrapped.map(|s| s as u32)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_expected_sequence(&mut self, seq: u32) {
+        let unwrapped = self.unwrap_sequence(seq);
+        self.expected_unwrapped = Some(unwrapped);
+    }
+
+    /// Unwraps 32-bit wire sequence numbers into a monotonically increasing 64-bit sequence space.
+    fn unwrap_sequence(&mut self, seq: u32) -> u64 {
+        match self.highest_seen_unwrapped {
+            None => {
+                let unwrapped = SEQUENCE_EPOCH_OFFSET + (seq as u64);
+                self.highest_seen_unwrapped = Some(unwrapped);
+                unwrapped
+            }
+            Some(highest) => {
+                let highest_wire = highest as u32;
+                let diff = seq.wrapping_sub(highest_wire) as i32 as i64;
+                let unwrapped = (highest as i64 + diff) as u64;
+                if unwrapped > highest {
+                    self.highest_seen_unwrapped = Some(unwrapped);
+                }
+                unwrapped
+            }
         }
     }
 
@@ -179,6 +218,7 @@ impl AdaptiveJitterBuffer {
                         k: src_cnt,
                         m: par_cnt,
                         base_sequence: None,
+                        unwrapped_base_seq: None,
                         first_arrival: now,
                         sources: HashMap::new(),
                         parities: HashMap::new(),
@@ -199,6 +239,18 @@ impl AdaptiveJitterBuffer {
             return;
         }
 
+        let seq = packet.header.sequence;
+        let unwrapped_seq = self.unwrap_sequence(seq);
+
+        // Discard packets older than expected playout cursor immediately.
+        // Check this BEFORE updating jitter or last_arrival/sender_timestamp to prevent
+        // stale out-of-order packets from polluting RFC 3550 jitter estimates.
+        if let Some(expected) = self.expected_unwrapped {
+            if unwrapped_seq < expected {
+                return;
+            }
+        }
+
         // Media packets: RFC 3550 Interarrival Jitter Calculation
         if let (Some(last_arr), Some(last_ts)) =
             (self.last_arrival_instant, self.last_sender_timestamp_us)
@@ -217,15 +269,6 @@ impl AdaptiveJitterBuffer {
         let target_delay = self.current_target_delay();
         self.stats.current_target_delay_us = target_delay.as_micros() as u64;
 
-        let seq = packet.header.sequence;
-
-        // Discard packets older than expected_sequence immediately (wrap-aware RFC 1982 comparison)
-        if let Some(expected) = self.expected_sequence {
-            if (seq.wrapping_sub(expected) as i32) < 0 {
-                return;
-            }
-        }
-
         // Check if packet belongs to an FEC protected block
         if (packet.header.flags & FLAG_FEC_PROTECTED) != 0 {
             let block_id = packet.header.timestamp_us; // Group by frame/block timestamp
@@ -243,6 +286,7 @@ impl AdaptiveJitterBuffer {
                     k: 0,
                     m: 0,
                     base_sequence: None,
+                    unwrapped_base_seq: None,
                     first_arrival: now,
                     sources: HashMap::new(),
                     parities: HashMap::new(),
@@ -255,10 +299,12 @@ impl AdaptiveJitterBuffer {
                 idx < MAX_FEC_K && tracker.sources.len() < MAX_FEC_K
             };
             if valid_idx {
-                let implied_base = seq.saturating_sub(idx as u32);
+                let implied_base = seq.wrapping_sub(idx as u32);
+                let unwrapped_implied_base = unwrapped_seq.saturating_sub(idx as u64);
                 let consistent = match tracker.base_sequence {
                     None => {
                         tracker.base_sequence = Some(implied_base);
+                        tracker.unwrapped_base_seq = Some(unwrapped_implied_base);
                         true
                     }
                     Some(b) => b == implied_base,
@@ -279,7 +325,7 @@ impl AdaptiveJitterBuffer {
         self.evict_stale(self.config.max_queue_depth.saturating_sub(1));
 
         self.queue.insert(
-            seq,
+            unwrapped_seq,
             QueuedPacket {
                 packet,
                 arrival_instant: now,
@@ -300,7 +346,7 @@ impl AdaptiveJitterBuffer {
         m: usize,
         scheme: FecScheme,
     ) {
-        if k == 0 || m == 0 || k + m > MAX_FEC_K {
+        if k == 0 || k + m > MAX_FEC_K {
             return;
         }
         if !self.fec_blocks.contains_key(&block_id) && self.fec_blocks.len() >= MAX_FEC_BLOCKS {
@@ -316,6 +362,7 @@ impl AdaptiveJitterBuffer {
                 k,
                 m,
                 base_sequence: None,
+                unwrapped_base_seq: None,
                 first_arrival: Instant::now(),
                 sources: HashMap::new(),
                 parities: HashMap::new(),
@@ -373,6 +420,10 @@ impl AdaptiveJitterBuffer {
                 Some(b) => b,
                 None => return false,
             };
+            let unwrapped_base = match tracker.unwrapped_base_seq {
+                Some(b) => b,
+                None => return false,
+            };
             let ref_entry = tracker.sources.values().next();
             if let Some((_ref_seq, ref_pkt)) = ref_entry {
                 let packet_type = ref_pkt.header.packet_type;
@@ -383,7 +434,10 @@ impl AdaptiveJitterBuffer {
                     if let std::collections::hash_map::Entry::Vacant(e) = tracker.sources.entry(idx)
                     {
                         let seq = base_seq.wrapping_add(idx as u32);
-                        if !self.queue.contains_key(&seq) {
+                        let unwrapped_seq = unwrapped_base + (idx as u64);
+                        if let std::collections::btree_map::Entry::Vacant(q_entry) =
+                            self.queue.entry(unwrapped_seq)
+                        {
                             let rec_header = PacketHeader::new(
                                 packet_type,
                                 stream_id,
@@ -395,14 +449,16 @@ impl AdaptiveJitterBuffer {
                             .with_fec_index(idx as u16);
 
                             let recovered_packet = Packet::new(rec_header, payload);
-                            self.queue.insert(
-                                recovered_packet.header.sequence,
-                                QueuedPacket {
-                                    packet: recovered_packet.clone(),
-                                    arrival_instant: ref_arrival,
-                                },
-                            );
-                            e.insert((recovered_packet.header.sequence, recovered_packet));
+                            q_entry.insert(QueuedPacket {
+                                packet: recovered_packet.clone(),
+                                arrival_instant: ref_arrival,
+                            });
+                            e.insert((seq, recovered_packet));
+                            if let Some(highest) = self.highest_seen_unwrapped {
+                                if unwrapped_seq > highest {
+                                    self.highest_seen_unwrapped = Some(unwrapped_seq);
+                                }
+                            }
                             self.stats.packets_reconstructed_fec += 1;
                         }
                     }
@@ -447,24 +503,61 @@ impl AdaptiveJitterBuffer {
         false
     }
 
+    /// Unwrapped 64-bit sequence check for FEC recoverability.
+    fn is_unwrapped_sequence_fec_recoverable(&self, missing_unwrapped: u64) -> bool {
+        for tracker in self.fec_blocks.values() {
+            let k = tracker.k;
+            let m = tracker.m;
+            if k == 0 || m == 0 {
+                continue;
+            }
+
+            if let Some(unwrapped_base) = tracker.unwrapped_base_seq {
+                if missing_unwrapped >= unwrapped_base
+                    && missing_unwrapped < unwrapped_base + (k as u64)
+                {
+                    let missing_idx = (missing_unwrapped - unwrapped_base) as usize;
+                    if !tracker.sources.contains_key(&missing_idx) {
+                        let missing_count = k.saturating_sub(tracker.sources.len());
+                        if missing_count > 0 && missing_count <= m {
+                            return true;
+                        }
+                    }
+                }
+            } else if let Some(base_seq) = tracker.base_sequence {
+                let missing_seq = missing_unwrapped as u32;
+                let offset = missing_seq.wrapping_sub(base_seq);
+                if offset < (k as u32) {
+                    let missing_idx = offset as usize;
+                    if !tracker.sources.contains_key(&missing_idx) {
+                        let missing_count = k.saturating_sub(tracker.sources.len());
+                        if missing_count > 0 && missing_count <= m {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Pops the next packet ready for playout if its target delay has elapsed.
     pub fn pop_ready_packet(&mut self, now: Instant) -> Option<Packet> {
         let target_delay = self.current_target_delay();
 
-        while let Some((&first_seq, item)) = self.queue.iter().next() {
-            if let Some(expected) = self.expected_sequence {
-                let diff = first_seq.wrapping_sub(expected) as i32;
-                if diff < 0 {
+        while let Some((&first_unwrapped_seq, item)) = self.queue.iter().next() {
+            if let Some(expected) = self.expected_unwrapped {
+                if first_unwrapped_seq < expected {
                     // Packet arrived after playout cursor has already advanced past it; discard
-                    self.queue.remove(&first_seq);
+                    self.queue.remove(&first_unwrapped_seq);
                     continue;
                 }
 
-                if diff > 0 {
-                    // Hole detected between expected and first_seq.
+                if first_unwrapped_seq > expected {
+                    // Hole detected between expected and first_unwrapped_seq.
                     // If the missing sequence is part of an incomplete recoverable FEC block,
                     // hold playout up to fec_hold_timeout for parity recovery.
-                    if self.is_sequence_fec_recoverable(expected) {
+                    if self.is_unwrapped_sequence_fec_recoverable(expected) {
                         let age = now.duration_since(item.arrival_instant);
                         if age < target_delay + self.config.fec_hold_timeout {
                             return None;
@@ -475,14 +568,14 @@ impl AdaptiveJitterBuffer {
 
             let age = now.duration_since(item.arrival_instant);
             if age >= target_delay {
-                let item = self.queue.remove(&first_seq)?;
-                if let Some(expected) = self.expected_sequence {
-                    let diff = first_seq.wrapping_sub(expected) as i32;
-                    if diff > 0 {
-                        self.stats.packets_lost += diff as u64;
+                let item = self.queue.remove(&first_unwrapped_seq)?;
+                if let Some(expected) = self.expected_unwrapped {
+                    if first_unwrapped_seq > expected {
+                        let diff = first_unwrapped_seq - expected;
+                        self.stats.packets_lost += diff;
                     }
                 }
-                self.expected_sequence = Some(first_seq.wrapping_add(1));
+                self.expected_unwrapped = Some(first_unwrapped_seq + 1);
                 self.stats.packets_delivered += 1;
                 return Some(item.packet);
             } else {
@@ -496,16 +589,17 @@ impl AdaptiveJitterBuffer {
     /// Evicts ancient packets if queue exceeds maximum threshold to avoid bufferbloat.
     pub fn evict_stale(&mut self, max_depth: usize) {
         while self.queue.len() > max_depth {
-            if let Some((&first_seq, _)) = self.queue.iter().next() {
-                self.queue.remove(&first_seq);
-                if let Some(expected) = self.expected_sequence {
-                    let diff = first_seq.wrapping_sub(expected) as i32;
-                    if diff >= 0 {
-                        self.stats.packets_lost += (diff as u64) + 1;
-                        self.expected_sequence = Some(first_seq.wrapping_add(1));
+            if let Some((&first_unwrapped_seq, _)) = self.queue.iter().next() {
+                self.queue.remove(&first_unwrapped_seq);
+                if let Some(expected) = self.expected_unwrapped {
+                    if first_unwrapped_seq >= expected {
+                        let diff = first_unwrapped_seq - expected;
+                        self.stats.packets_lost += diff + 1;
+                        self.expected_unwrapped = Some(first_unwrapped_seq + 1);
                     }
                 } else {
                     self.stats.packets_lost += 1;
+                    self.expected_unwrapped = Some(first_unwrapped_seq + 1);
                 }
             } else {
                 break;
@@ -1007,7 +1101,7 @@ mod tests {
         // Pop packet 1 -> expected_sequence is initialized to Some(2)
         let popped_1 = jb.pop_ready_packet(now).expect("Packet 1 ready");
         assert_eq!(popped_1.header.sequence, 1);
-        assert_eq!(jb.expected_sequence, Some(2));
+        assert_eq!(jb.expected_sequence(), Some(2));
         assert_eq!(jb.stats().packets_lost, 0);
 
         // Now burst of packets arrives: 5, 6, 7, 8 (packets 2, 3, 4 are lost in transit)
@@ -1136,7 +1230,7 @@ mod tests {
         // Pop packet u32::MAX -> cursor must wrap to 0 without debug panic
         let popped = jb.pop_ready_packet(now).expect("u32::MAX should pop");
         assert_eq!(popped.header.sequence, u32::MAX);
-        assert_eq!(jb.expected_sequence, Some(0));
+        assert_eq!(jb.expected_sequence(), Some(0));
 
         // Ingest packet 0 (post-wrap)
         let p_zero = Packet::new(
@@ -1148,7 +1242,7 @@ mod tests {
         // Packet 0 must not be discarded as old
         let popped_zero = jb.pop_ready_packet(now).expect("Packet 0 should pop");
         assert_eq!(popped_zero.header.sequence, 0);
-        assert_eq!(jb.expected_sequence, Some(1));
+        assert_eq!(jb.expected_sequence(), Some(1));
     }
 
     #[test]
@@ -1168,14 +1262,14 @@ mod tests {
         jb.ingest_packet(p1, now);
         // Pop to set expected_sequence = Some(u32::MAX)
         let _ = jb.pop_ready_packet(now);
-        assert_eq!(jb.expected_sequence, Some(0));
+        assert_eq!(jb.expected_sequence(), Some(0));
 
         // Now test eviction when first_seq is u32::MAX and expected is u32::MAX
         let mut jb2 = AdaptiveJitterBuffer::new(JitterBufferConfig {
             max_queue_depth: 1,
             ..Default::default()
         });
-        jb2.expected_sequence = Some(u32::MAX);
+        jb2.set_expected_sequence(u32::MAX);
         let p_max = Packet::new(
             PacketHeader::new(PacketType::VideoFrameChunk, 0, u32::MAX, 100, b"max"),
             Bytes::from_static(b"max"),
@@ -1188,7 +1282,130 @@ mod tests {
         jb2.ingest_packet(p_zero, now);
 
         // Eviction should have run, advancing expected_sequence to Some(0) instead of saturating
-        assert_eq!(jb2.expected_sequence, Some(0));
+        assert_eq!(jb2.expected_sequence(), Some(0));
+    }
+
+    #[test]
+    fn test_jitter_buffer_queue_order_and_fec_across_wrap_boundary() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig {
+            min_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            fec_hold_timeout: Duration::from_millis(20),
+            ..Default::default()
+        });
+        let now = Instant::now();
+        let block_id = 12345678;
+
+        let s0 = Bytes::from_static(b"data-wrap-0");
+        let s1 = Bytes::from_static(b"data-wrap-1");
+        let s2 = Bytes::from_static(b"data-wrap-2");
+        let s3 = Bytes::from_static(b"data-wrap-3");
+
+        let sources = vec![s0.clone(), s1.clone(), s2.clone(), s3.clone()];
+        let parities = ReedSolomonFec::encode(block_id, &sources, 1).unwrap();
+        jb.register_fec_block(block_id, 4, 1);
+
+        // Source packets straddling u32::MAX:
+        // Index 0 -> seq u32::MAX - 1 (4294967294)
+        // Index 1 -> seq u32::MAX     (4294967295) -- WE DROP THIS PACKET TO TRIGGER FEC RECOVERY
+        // Index 2 -> seq 0            (post-wrap)
+        // Index 3 -> seq 1            (post-wrap)
+        let p0 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, u32::MAX - 1, block_id, &s0)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(0),
+            s0,
+        );
+        let p2 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 0, block_id, &s2)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(2),
+            s2,
+        );
+        let p3 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 1, block_id, &s3)
+                .with_flags(FLAG_FEC_PROTECTED)
+                .with_fec_index(3),
+            s3,
+        );
+        let parity_pkt = Packet::new(
+            PacketHeader::new(PacketType::FecParity, 0, 2, block_id, &parities[0])
+                .with_flags(FLAG_FEC_PROTECTED),
+            parities[0].clone(),
+        );
+
+        // Ingest ALL packets (both sides of the wrap: pre-wrap p0, post-wrap p2, p3, and parity)
+        // simultaneously BEFORE popping anything!
+        jb.ingest_packet(p0, now);
+        jb.ingest_packet(p2, now);
+        jb.ingest_packet(p3, now);
+        jb.ingest_packet(parity_pkt, now);
+
+        // Verification 1: FEC recovery reconstructed the dropped packet (seq u32::MAX)
+        assert_eq!(
+            jb.stats().packets_reconstructed_fec,
+            1,
+            "FEC must recover packet across the wrap boundary"
+        );
+        assert_eq!(jb.queue_len(), 4, "All 4 packets must be in queue");
+
+        // Verification 2: Playout delivers strictly in sequential order across wrap
+        let playout = now + Duration::from_millis(30);
+        let out0 = jb.pop_ready_packet(playout).expect("Packet 0 should pop");
+        let out1 = jb.pop_ready_packet(playout).expect("Packet 1 should pop");
+        let out2 = jb.pop_ready_packet(playout).expect("Packet 2 should pop");
+        let out3 = jb.pop_ready_packet(playout).expect("Packet 3 should pop");
+
+        assert_eq!(out0.header.sequence, u32::MAX - 1);
+        assert_eq!(out1.header.sequence, u32::MAX);
+        assert_eq!(out2.header.sequence, 0);
+        assert_eq!(out3.header.sequence, 1);
+        assert!(jb.pop_ready_packet(playout).is_none());
+
+        // Zero packets lost, exactly 4 delivered!
+        assert_eq!(jb.stats().packets_lost, 0);
+        assert_eq!(jb.stats().packets_delivered, 4);
+    }
+
+    #[test]
+    fn test_jitter_buffer_late_packets_do_not_corrupt_jitter_estimate() {
+        let mut jb = AdaptiveJitterBuffer::new(JitterBufferConfig::default());
+        let now = Instant::now();
+
+        // Ingest sequence 5 with timestamp 5000us
+        let p5 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 5, 5000, b"p5"),
+            Bytes::from_static(b"p5"),
+        );
+        jb.ingest_packet(p5, now);
+
+        // Playout pops sequence 5, advancing expected cursor to 6
+        let playout = now + Duration::from_millis(50);
+        let popped = jb.pop_ready_packet(playout).unwrap();
+        assert_eq!(popped.header.sequence, 5);
+        assert_eq!(jb.stats().current_jitter_us, 0.0);
+        assert_eq!(jb.last_sender_timestamp_us, Some(5000));
+
+        // Now a stale packet (sequence 4) arrives 100ms later with timestamp 4000us
+        let late_arrival = now + Duration::from_millis(150);
+        let p4 = Packet::new(
+            PacketHeader::new(PacketType::VideoFrameChunk, 0, 4, 4000, b"p4"),
+            Bytes::from_static(b"p4"),
+        );
+        jb.ingest_packet(p4, late_arrival);
+
+        // Assert: Jitter estimate MUST NOT spike, and last_sender_timestamp MUST NOT be overwritten
+        assert_eq!(
+            jb.stats().current_jitter_us,
+            0.0,
+            "Late discarded packet must not corrupt RFC 3550 jitter calculation"
+        );
+        assert_eq!(
+            jb.last_sender_timestamp_us,
+            Some(5000),
+            "Late discarded packet must not overwrite last_sender_timestamp"
+        );
+        assert_eq!(jb.queue_len(), 0);
     }
 
     #[test]

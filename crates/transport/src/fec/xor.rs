@@ -87,6 +87,8 @@ impl XorFec {
         if header.block_id != block_id
             || header.source_count as usize != k
             || header.scheme != super::FecScheme::Xor
+            || header.parity_count != 1
+            || header.parity_index != 0
         {
             return Err(FecError::CorruptHeader);
         }
