@@ -7,7 +7,7 @@ pub mod telemetry;
 pub mod video;
 
 pub use error::ProtocolError;
-pub use handshake::{ClientHandshake, DisplayInfo, ServerHandshake};
+pub use handshake::{ClientHandshake, DisplayConfigMessage, DisplayInfo, ServerHandshake};
 pub use input::{ElementState, InputEvent, MouseButton};
 pub use packet::{
     Packet, PacketHeader, PacketType, FLAG_COMPRESSED, FLAG_FEC_PROTECTED, FLAG_INTRA_REFRESH,

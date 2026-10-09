@@ -10,6 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod ipc;
+pub mod multi_display;
+
+pub use ipc::{
+    daemon_pid_path, daemon_runtime_dir, daemon_socket_path, run_ipc_server, send_daemon_request,
+    DaemonRequest, DaemonResponse,
+};
+pub use multi_display::MultiDisplayHost;
+
 #[derive(Error, Debug)]
 pub enum HostError {
     #[error("Capture failure: {0}")]
@@ -27,6 +36,12 @@ pub enum HostError {
     #[error("Input error: {0}")]
     Input(#[from] linux_quest_input::InputError),
 
+    #[error("Display error: {0}")]
+    Display(#[from] linux_quest_display::DisplayError),
+
+    #[error("Bincode error: {0}")]
+    Bincode(#[from] Box<bincode::ErrorKind>),
+
     #[error("Session is not running")]
     NotRunning,
 }
@@ -43,6 +58,7 @@ where
     encoder: E,
     transport: T,
     input: I,
+    display_host: Option<Arc<MultiDisplayHost>>,
     stream_id: u16,
     sequence: u32,
     running: Arc<AtomicBool>,
@@ -61,10 +77,16 @@ where
             encoder,
             transport,
             input,
+            display_host: None,
             stream_id,
             sequence: 0,
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_display_host(mut self, host: Arc<MultiDisplayHost>) -> Self {
+        self.display_host = Some(host);
+        self
     }
 
     pub fn running_flag(&self) -> Arc<AtomicBool> {
@@ -157,6 +179,91 @@ where
             PacketType::InputEvent => {
                 if let Ok(event) = bincode::deserialize(&packet.payload) {
                     self.input.inject_event(event)?;
+                }
+            }
+            PacketType::DisplayConfig => {
+                let reply = match bincode::deserialize::<linux_quest_protocol::DisplayConfigMessage>(
+                    &packet.payload,
+                ) {
+                    Ok(msg) => {
+                        tracing::info!(msg = ?msg, "Received DisplayConfig command from client");
+                        if let Some(host) = &self.display_host {
+                            match msg {
+                                linux_quest_protocol::DisplayConfigMessage::SetMonitorCount {
+                                    count,
+                                    width,
+                                    height,
+                                    refresh_rate,
+                                    dpi,
+                                    layout_mode,
+                                } => {
+                                    let layout = match layout_mode {
+                                        1 => linux_quest_display::DisplayLayoutMode::Vertical,
+                                        2 => linux_quest_display::DisplayLayoutMode::Grid,
+                                        _ => linux_quest_display::DisplayLayoutMode::Horizontal,
+                                    };
+                                    let base_cfg = linux_quest_display::VirtualMonitorConfig::new(
+                                        1,
+                                        "Quest-Virtual",
+                                        width,
+                                        height,
+                                        refresh_rate,
+                                    )
+                                    .with_dpi(dpi);
+                                    match host.toggle_monitors(count, &base_cfg, layout).await {
+                                        Ok(monitors) => {
+                                            let display_infos: Vec<
+                                                linux_quest_protocol::DisplayInfo,
+                                            > = monitors
+                                                .into_iter()
+                                                .map(|m| linux_quest_protocol::DisplayInfo {
+                                                    display_id: m.id as u16,
+                                                    name: m.name,
+                                                    width: m.width,
+                                                    height: m.height,
+                                                    refresh_rate: m.refresh_rate,
+                                                    dpi: m.dpi,
+                                                    is_virtual: m.is_virtual,
+                                                })
+                                                .collect();
+                                            Some(linux_quest_protocol::DisplayConfigMessage::ActiveMonitors(
+                                                display_infos,
+                                            ))
+                                        }
+                                        Err(e) => {
+                                            Some(linux_quest_protocol::DisplayConfigMessage::Error(
+                                                e.to_string(),
+                                            ))
+                                        }
+                                    }
+                                }
+                                linux_quest_protocol::DisplayConfigMessage::ActiveMonitors(_)
+                                | linux_quest_protocol::DisplayConfigMessage::Error(_) => None,
+                            }
+                        } else {
+                            Some(linux_quest_protocol::DisplayConfigMessage::Error(
+                                "Display host not initialized on stream session".into(),
+                            ))
+                        }
+                    }
+                    Err(e) => Some(linux_quest_protocol::DisplayConfigMessage::Error(format!(
+                        "Failed to deserialize DisplayConfig message: {e}"
+                    ))),
+                };
+
+                if let Some(reply_msg) = reply {
+                    let reply_bytes = bincode::serialize(&reply_msg)?;
+                    self.sequence += 1;
+                    let reply_header = PacketHeader::new(
+                        PacketType::DisplayConfig,
+                        self.stream_id,
+                        self.sequence,
+                        packet.header.timestamp_us,
+                        &reply_bytes,
+                    );
+                    self.transport
+                        .send_packet(Packet::new(reply_header, reply_bytes.into()))
+                        .await?;
                 }
             }
             PacketType::Disconnect => {
@@ -289,5 +396,52 @@ mod tests {
 
         let packet = ep_client.recv_packet().await.expect("Recv failed");
         assert_eq!(packet.header.packet_type, PacketType::VideoFrameChunk);
+    }
+
+    #[tokio::test]
+    async fn test_host_handle_display_config_packet() {
+        let capture = SyntheticCapture::new(0, 1920, 1080, 60);
+        let encoder = MockVideoEncoder::new(EncoderConfig::default());
+        let (ep_host, mut ep_client) = LoopbackEndpoint::create_pair();
+        let input = MockInputInjector::new();
+
+        let mock_backend = linux_quest_display::backend::mock::MockDisplayBackend::new();
+        let host = Arc::new(MultiDisplayHost::new(Box::new(mock_backend)));
+
+        let mut session =
+            HostStreamSession::new(capture, encoder, ep_host, input, 0).with_display_host(host);
+
+        let req = linux_quest_protocol::DisplayConfigMessage::SetMonitorCount {
+            count: 2,
+            width: 1920,
+            height: 1080,
+            refresh_rate: 60,
+            dpi: 120,
+            layout_mode: 0,
+        };
+        let payload = bytes::Bytes::from(bincode::serialize(&req).unwrap());
+        let header = PacketHeader::new(PacketType::DisplayConfig, 0, 1, 1000, &payload);
+        let packet = Packet::new(header, payload);
+
+        session
+            .handle_incoming_packet(packet)
+            .await
+            .expect("Handle DisplayConfig failed");
+
+        let reply_packet = ep_client.recv_packet().await.expect("Recv reply failed");
+        assert_eq!(reply_packet.header.packet_type, PacketType::DisplayConfig);
+        let reply: linux_quest_protocol::DisplayConfigMessage =
+            bincode::deserialize(&reply_packet.payload).expect("Deserialize reply failed");
+
+        match reply {
+            linux_quest_protocol::DisplayConfigMessage::ActiveMonitors(monitors) => {
+                assert_eq!(monitors.len(), 2);
+                assert_eq!(monitors[0].display_id, 1);
+                assert_eq!(monitors[0].dpi, 120);
+                assert_eq!(monitors[1].display_id, 2);
+                assert_eq!(monitors[1].dpi, 120);
+            }
+            _ => panic!("Expected ActiveMonitors response"),
+        }
     }
 }

@@ -29,3 +29,21 @@ pub struct ServerHandshake {
     pub negotiated_bitrate_mbps: u32,
     pub displays: Vec<DisplayInfo>,
 }
+
+/// Dynamic multi-monitor control message exchanged over PacketType::DisplayConfig.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayConfigMessage {
+    /// Request to set virtual monitor count (1, 2, or 3) and layout
+    SetMonitorCount {
+        count: u32,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+        dpi: u32,
+        layout_mode: u8,
+    },
+    /// Notification of updated active monitors
+    ActiveMonitors(Vec<DisplayInfo>),
+    /// Notification of an error during display configuration
+    Error(String),
+}
