@@ -12,6 +12,10 @@ linux-quest-capture = { path = "../capture" }
 linux-quest-encoder = { path = "../encoder" }
 linux-quest-transport = { path = "../transport" }
 linux-quest-input = { path = "../input" }
+linux-quest-display = { path = "../display" }
+clap = { version = "4.5", features = ["derive"] }
+serde.workspace = true
+libc.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 bincode.workspace = true

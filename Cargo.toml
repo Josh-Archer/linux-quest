@@ -8,6 +8,7 @@ members = [
     "crates/input",
     "crates/host",
     "crates/client",
+    "crates/display",
 ]
 
 [workspace.package]
