@@ -55,6 +55,10 @@ struct DaemonArgs {
     /// Run daemon with interactive terminal status dashboard in foreground
     #[arg(long)]
     tui: bool,
+
+    /// Do not advertise this daemon on the LAN via mDNS (Quest clients then need manual IP entry)
+    #[arg(long)]
+    no_advertise: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -154,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         || matches!(&cli.command, Some(Commands::Dashboard(_)))
         || matches!(
             &cli.command,
-            Some(Commands::Daemon(DaemonArgs { tui: true }))
+            Some(Commands::Daemon(DaemonArgs { tui: true, .. }))
         );
 
     if !is_tui {
@@ -270,8 +274,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     [0, 0, 0, 0],
                     linux_quest_transport::DEFAULT_INPUT_PORT,
                 ));
+                let mut input_port = None;
                 match linux_quest_host::HostInputReceiver::bind_auto(input_bind_addr).await {
                     Ok(mut input_service) => {
+                        input_port = input_service.local_addr().ok().map(|a| a.port());
                         let running_flag = input_service.running_flag();
                         let auto_injector = input_service.injector();
                         let mut shutdown_rx_input = shutdown_tx.subscribe();
@@ -308,8 +314,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     [0, 0, 0, 0],
                     linux_quest_transport::DEFAULT_CONTROL_PORT,
                 ));
+                let mut control_port = None;
                 match linux_quest_host::HostClipboardService::bind_auto(control_bind_addr).await {
                     Ok(mut clipboard_service) => {
+                        control_port = clipboard_service.local_addr().map(|a| a.port());
                         let running_flag = clipboard_service.running_flag();
                         let mut shutdown_rx_clipboard = shutdown_tx.subscribe();
                         tokio::spawn(async move {
@@ -337,7 +345,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
 
-                run_ipc_server(host, shutdown_rx).await?;
+                // Advertise only the ports that were really bound above.
+                let listening = match (control_port, input_port) {
+                    (Some(control), Some(input)) => {
+                        Some(linux_quest_host::advertise::ListeningPorts { control, input })
+                    }
+                    _ => None,
+                };
+                let advertiser = linux_quest_host::advertise::advertise_daemon(
+                    !daemon_args.no_advertise,
+                    linux_quest_host::advertise::system_instance_name(),
+                    listening,
+                )
+                .await;
+
+                let served = run_ipc_server(host, shutdown_rx).await;
+                if let Some(advertiser) = advertiser {
+                    advertiser.stop().await;
+                }
+                served?;
                 info!("Daemon stopped cleanly.");
             }
         }
